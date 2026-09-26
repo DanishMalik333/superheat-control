@@ -1,0 +1,19 @@
+build
+mx.scratch
+!.settings
+
+# CubeIDE / CMake artifacts
+cmake-build-*/
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+
+# OMC session state
+.omc/
