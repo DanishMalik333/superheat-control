@@ -1,5 +1,4 @@
 {
-    "cmake.sourceDirectory": "D:/Embedded Systems/HVACPlant/Drivers/CMSIS/NN",
     "cmake.cmakePath": "cube-cmake",
     "cmake.configureArgs": [
         "-DCMAKE_COMMAND=cube-cmake"

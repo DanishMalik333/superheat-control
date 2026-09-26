@@ -20,6 +20,7 @@
 #include "main.h"
 #include "pid.h"
 #include <stdio.h>
+#include <string.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -44,16 +45,13 @@
 
 typedef int32_t BME280_S32_t;
 
-/* PID gains and sample time must match the Simulink model exactly, or the
- * integrator term (Ki * error * ts) no longer matches the tuned behavior.
- * Re-tuned for Ts=1s against the re-discretized plant (see plant.h) --
- * original Kp=1/Ki=0.5 were tuned for the model's original Ts=0.01s plant
- * and produced excessive overshoot/aggressiveness once Ts moved to 1s. */
 #define PID_KP        0.1
 #define PID_KI        0.015
-#define PID_TS        1.0    /* seconds; matches the 1s loop cycle below */
+#define PID_TS        1.0
 #define PID_OUT_MIN   0.1
 #define PID_OUT_MAX   0.9
+
+#define LINK_RX_BUF_LEN   32
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -161,6 +159,53 @@ int __io_putchar(int ch)
   HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
   return ch;
 }
+
+/* Reads one "<tick>,<value>\r\n" line from USART1. Returns 1 on success. */
+static int Link_ReceiveLine(unsigned long *tick, double *value)
+{
+  static char buf[LINK_RX_BUF_LEN];
+  uint16_t len = 0;
+  uint8_t ch = 0;
+
+  while (len < LINK_RX_BUF_LEN - 1)
+  {
+    HAL_StatusTypeDef st = HAL_UART_Receive(&huart1, &ch, 1, 500);
+    if (st != HAL_OK)
+    {
+      printf("RX status=%d\r\n", (int)st);
+      return 0;
+    }
+
+    if (ch == '\n')
+    {
+      buf[len] = '\0';
+      break;
+    }
+
+    if (ch != '\r')
+    {
+      buf[len++] = (char)ch;
+    }
+  }
+
+  if (len == 0 || len >= LINK_RX_BUF_LEN - 1)
+  {
+    return 0;
+  }
+
+  buf[len] = '\0';
+
+  return sscanf(buf, "%lu,%lf", tick, value) == 2;
+}
+
+static void Link_SendLine(unsigned long tick, double value)
+{
+  char out[LINK_RX_BUF_LEN];
+  int n = snprintf(out, sizeof(out), "%lu,%.4f\r\n", tick, value);
+
+  HAL_StatusTypeDef st = HAL_UART_Transmit(&huart1, (uint8_t *)out, (uint16_t)n, 100);
+  printf("TX status=%d bytes=%d payload=%s", (int)st, n, out);
+}
 /* USER CODE END 0 */
 
 /**
@@ -206,9 +251,12 @@ int main(void)
   PID_Init(&pid, PID_KP, PID_KI, PID_TS, PID_OUT_MIN, PID_OUT_MAX);
 
   double temperature_degC = 0.0;
-  /* Placeholder setpoint; replace with the real superheat target once
-   * pressure sensing / saturation-temperature lookup is implemented. */
-  double setpoint_degC = 10.0;
+  double setpoint_degC = 10.0; /* placeholder until superheat is computed */
+
+  /* PID's measurement comes from Board 1's simulated plant, not the BME280. */
+  unsigned long tick = 0;
+  double simulated_temp = 0.0;
+  double valve_output = PID_OUT_MIN;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -222,11 +270,27 @@ int main(void)
     BME280_S32_t adc_T = BME280_ReadRawTemperature();
     temperature_degC = BME280_CompensateTemperature(adc_T);
 
-    /* NOTE: using raw temperature as a placeholder measurement; this should
-     * be the computed superheat value once available. */
-    double valve_output = PID_Update(&pid, setpoint_degC, temperature_degC);
+    /* Exchange valve_output for the plant's simulated temp; hold last value on a missed frame. */
+    unsigned long echoed_tick = 0;
+    double received_temp = 0.0;
 
-    printf("Temperature: %.2f DegC, Valve: %.3f\r\n", temperature_degC, valve_output);
+    Link_SendLine(tick, valve_output);
+
+    if (Link_ReceiveLine(&echoed_tick, &received_temp))
+    {
+      simulated_temp = received_temp;
+    }
+    else
+    {
+      printf("HIL link: malformed/missing frame, holding last simulated_temp\r\n");
+    }
+
+    valve_output = PID_Update(&pid, setpoint_degC, simulated_temp);
+
+    printf("tick=%lu BME280=%.2f DegC (logged only), Plant=%.4f, Valve=%.3f\r\n",
+           tick, temperature_degC, simulated_temp, valve_output);
+
+    tick++;
     HAL_Delay(1000);
     /* USER CODE END WHILE */
 
