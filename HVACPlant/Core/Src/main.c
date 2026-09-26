@@ -34,11 +34,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-/* Inter-board line protocol: "<tick>,<value>\r\n" ASCII CSV, received/sent
- * over USART1 (the inter-board link -- NOT USART2, which stays on ST-LINK
- * VCP for debug logging over the same USB cable used to flash this board). */
 #define LINK_RX_BUF_LEN   32
-#define LINK_INITIAL_Y    0.0 /* plant starting condition, degC-equivalent offset from setpoint */
+#define LINK_INITIAL_Y    0.0
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -71,12 +68,7 @@ int __io_putchar(int ch)
   return ch;
 }
 
-/* Blocking read of one "<tick>,<value>\r\n" line from the inter-board UART.
- * Reads a byte at a time until '\n' or the buffer fills. Returns 1 and fills
- * *tick/*value on a successfully parsed line, 0 on a malformed/overflowed
- * line (caller should treat this as a missed frame and hold last-known-good
- * values, per Week 3's fallback-behavior guidance -- not yet implemented on
- * this first pass, see plant.h/PROGRESS.md). */
+/* Reads one "<tick>,<value>\r\n" line from USART1. Returns 1 on success. */
 static int Link_ReceiveLine(unsigned long *tick, double *value)
 {
   static char buf[LINK_RX_BUF_LEN];
@@ -85,8 +77,10 @@ static int Link_ReceiveLine(unsigned long *tick, double *value)
 
   while (len < LINK_RX_BUF_LEN - 1)
   {
-    if (HAL_UART_Receive(&huart1, &ch, 1, HAL_MAX_DELAY) != HAL_OK)
+    HAL_StatusTypeDef st = HAL_UART_Receive(&huart1, &ch, 1, 500);
+    if (st != HAL_OK)
     {
+      printf("RX status=%d\r\n", (int)st);
       return 0;
     }
 
@@ -117,7 +111,8 @@ static void Link_SendLine(unsigned long tick, double value)
   char out[LINK_RX_BUF_LEN];
   int n = snprintf(out, sizeof(out), "%lu,%.4f\r\n", tick, value);
 
-  HAL_UART_Transmit(&huart1, (uint8_t *)out, (uint16_t)n, HAL_MAX_DELAY);
+  HAL_StatusTypeDef st = HAL_UART_Transmit(&huart1, (uint8_t *)out, (uint16_t)n, 100);
+  printf("TX status=%d bytes=%d payload=%s", (int)st, n, out);
 }
 /* USER CODE END 0 */
 
