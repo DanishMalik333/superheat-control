@@ -51,16 +51,17 @@ def main():
     setpoint = deque(maxlen=args.window)
 
     fig, (ax_temp, ax_valve) = plt.subplots(2, 1, sharex=True, figsize=(9, 6))
-    line_plant, = ax_temp.plot([], [], label="Plant temp (degC)")
-    line_setpoint, = ax_temp.plot([], [], "--", label="Setpoint (degC)")
-    ax_temp.set_ylabel("Temperature (degC)")
+    line_plant, = ax_temp.plot([], [], label="Superheat (simulated plant), °C")
+    line_setpoint, = ax_temp.plot([], [], "--", label="Superheat setpoint, °C")
+    ax_temp.set_ylabel("Superheat (°C)")
+    ax_temp.set_title("Superheat Control — Live HIL Response")
     ax_temp.legend(loc="upper right")
     ax_temp.grid(True)
 
-    line_valve, = ax_valve.plot([], [], color="tab:orange", label="Valve output")
-    ax_valve.set_ylabel("Valve output")
+    line_valve, = ax_valve.plot([], [], color="tab:orange", label="Valve opening, %")
+    ax_valve.set_ylabel("Valve opening (%)")
     ax_valve.set_xlabel("Tick")
-    ax_valve.set_ylim(0.0, 1.0)
+    ax_valve.set_ylim(0.0, 100.0)
     ax_valve.legend(loc="upper right")
     ax_valve.grid(True)
 
@@ -87,7 +88,7 @@ def main():
 
             ticks.append(tick)
             plant_temp.append(plant)
-            valve.append(val)
+            valve.append(val * 100.0)
             setpoint.append(sp)
             rows_added += 1
         return rows_added

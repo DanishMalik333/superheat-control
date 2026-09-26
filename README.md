@@ -7,9 +7,9 @@ plant, closing a real control loop over a live inter-board link.
 
 ![Step response](docs/images/step_response.png)
 
-*Plant temperature converging to a 10°C setpoint under discrete PID control
-(Kp=0.1, Ki=0.015), with the corresponding valve output settling to steady
-state. Captured live from Board 1's UART debug stream — see
+*Simulated superheat converging to a 10°C setpoint under discrete PID control
+(Kp=0.1, Ki=0.015), with the corresponding valve opening (%) settling to
+steady state. Captured live from Board 1's UART debug stream — see
 [Plotting the control loop](#plotting-the-control-loop).*
 
 ## Architecture
@@ -27,6 +27,25 @@ through the plant model and replies with the resulting simulated temperature,
 which becomes the PID's measurement input. This makes the HIL loop a genuine
 closed loop — the controller board never sees the "real" plant, only what the
 second board computes and sends back over the wire.
+
+```mermaid
+flowchart LR
+    subgraph Board1["Board 1 — Controller"]
+        BME280["BME280\n(SPI1, logged only)"]
+        PID["Discrete PID\npid.c"]
+    end
+
+    subgraph Board2["Board 2 — Plant Simulator"]
+        Plant["Discrete plant model\nplant.c"]
+    end
+
+    BME280 -.->|"logged, not yet\nin control loop"| PID
+    PID -->|"valve_output\n(USART1, 115200)"| Plant
+    Plant -->|"simulated_temp\n(USART1, 115200)"| PID
+
+    Board1 -->|"CSV telemetry"| VCP1["ST-LINK VCP\n(USART2)"]
+    Board2 -->|"per-tick log"| VCP2["ST-LINK VCP\n(USART2)"]
+```
 
 ### Control loop
 
@@ -64,6 +83,56 @@ flags a complete line on `\n`, and immediately re-arms the next single-byte
 receive before returning. The main loop's `Link_ReceiveLine` just waits on
 that flag with a timeout, instead of touching bytes directly. This removed the
 CPU-availability race entirely rather than just improving its odds.
+
+## FreeRTOS task split (Board 1)
+
+Board 1 originally ran a single bare-metal superloop doing everything
+sequentially: BME280 read, UART link exchange, PID update, debug print. It now
+runs three FreeRTOS (CMSIS-RTOS v2) tasks instead, connected by two depth-1
+message queues that always hold the latest value:
+
+- **`SensorTask`** — reads the BME280 once per second, independent of the
+  control loop's timing.
+- **`LinkTask`** (`osPriorityAboveNormal`) — sends `valve_output` to Board 2,
+  waits for its reply, and pushes the result into `SimTempQueue`.
+- **`ControlTask`** — reads `SimTempQueue`, runs `PID_Update`, pushes the new
+  `valve_output` into `ValveOutputQueue`, and prints the CSV debug line.
+
+```mermaid
+flowchart TB
+    Sensor["SensorTask\n(osPriorityNormal)\nBME280 read, 1s"]
+    Link["LinkTask\n(osPriorityAboveNormal)\nUART exchange w/ Board 2"]
+    Control["ControlTask\n(osPriorityNormal)\nPID_Update + CSV log"]
+
+    ValveQ[["ValveOutputQueue\n(depth 1)"]]
+    TempQ[["SimTempQueue\n(depth 1)"]]
+
+    Control -->|"valve_output"| ValveQ
+    ValveQ -->|"valve_output"| Link
+    Link -->|"simulated_temp"| TempQ
+    TempQ -->|"simulated_temp"| Control
+
+    Sensor -.->|"latest_bme280_degC\n(logged only)"| Control
+```
+
+Two issues surfaced while bringing this up, both worth knowing if you extend
+this further:
+
+- **Missing NVIC priority grouping.** `HAL_MspInit` never called
+  `HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4)`. FreeRTOS's Cortex-M
+  port assumes 4 preemption-priority bits; running on the CPU's reset default
+  silently broke interrupt masking, producing zero serial output with no
+  error of any kind.
+- **Stack overflow in `LinkTask`.** `sscanf`/`snprintf` float formatting in
+  newlib-nano is stack-heavy, more than bare-metal's single large shared stack
+  ever made obvious. `configCHECK_FOR_STACK_OVERFLOW` and a
+  `vApplicationStackOverflowHook` were added to surface this instead of
+  silently corrupting memory; `LinkTask`/`ControlTask` are now sized to 512
+  words, `SensorTask` to 256.
+
+`Link_ReceiveLine`'s wait loop also switched from a bare spin to `osDelay(1)`
+per iteration — `LinkTask` runs at the highest priority, so a non-yielding
+spin there starved the other two tasks entirely after their first cycle.
 
 ## Repository layout
 
@@ -123,6 +192,6 @@ python tools/plot_from_log.py tools/logs/run_20260926_151558.csv --out step_resp
 - [x] Two-board HIL wiring and UART inter-board link
 - [x] Interrupt-driven UART reception (see above)
 - [x] Live plotting / CSV logging of the control loop
+- [x] FreeRTOS task split on Board 1 (sensor read / link / control loop)
 - [ ] Superheat computation from real sensor data (BME280 is currently logged
       but not yet part of the control loop)
-- [ ] FreeRTOS task split (sensor read / link / control loop)

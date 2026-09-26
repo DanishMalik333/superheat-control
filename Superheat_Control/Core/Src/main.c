@@ -52,7 +52,7 @@ typedef int32_t BME280_S32_t;
 #define PID_OUT_MAX   0.9
 
 #define LINK_RX_BUF_LEN   32
-#define SETPOINT_DEGC     10.0 /* placeholder until superheat is computed */
+#define SETPOINT_DEGC     10.0 /* superheat setpoint, degC */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/

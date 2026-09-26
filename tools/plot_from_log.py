@@ -22,20 +22,20 @@ def main():
         for row in csv.DictReader(f):
             ticks.append(int(row["tick"]))
             plant_temp.append(float(row["plant_degC"]))
-            valve.append(float(row["valve"]))
+            valve.append(float(row["valve"]) * 100.0)
             setpoint.append(float(row["setpoint_degC"]))
 
     fig, (ax_temp, ax_valve) = plt.subplots(2, 1, sharex=True, figsize=(9, 6))
 
-    ax_temp.plot(ticks, plant_temp, label="Plant temp (degC)")
-    ax_temp.plot(ticks, setpoint, "--", label="Setpoint (degC)")
-    ax_temp.set_ylabel("Temperature (degC)")
+    ax_temp.plot(ticks, plant_temp, label="Superheat (simulated plant), °C")
+    ax_temp.plot(ticks, setpoint, "--", label="Superheat setpoint, °C")
+    ax_temp.set_ylabel("Superheat (°C)")
     ax_temp.set_title("Superheat Control HIL Step Response")
     ax_temp.legend(loc="upper right")
     ax_temp.grid(True)
 
-    ax_valve.plot(ticks, valve, color="tab:orange", label="Valve output")
-    ax_valve.set_ylabel("Valve output")
+    ax_valve.plot(ticks, valve, color="tab:orange", label="Valve opening, %")
+    ax_valve.set_ylabel("Valve opening (%)")
     ax_valve.set_xlabel("Tick")
     ax_valve.legend(loc="upper right")
     ax_valve.grid(True)
