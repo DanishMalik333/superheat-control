@@ -184,14 +184,3 @@ To regenerate a static plot (e.g. for a report) from a saved log:
 ```
 python tools/plot_from_log.py tools/logs/run_20260926_151558.csv --out step_response.png
 ```
-
-## Status
-
-- [x] Ts reconciliation between Simulink tuning and firmware (`Ts=1.0s`)
-- [x] PID and plant models modularized into reusable `pid.c`/`plant.c`
-- [x] Two-board HIL wiring and UART inter-board link
-- [x] Interrupt-driven UART reception (see above)
-- [x] Live plotting / CSV logging of the control loop
-- [x] FreeRTOS task split on Board 1 (sensor read / link / control loop)
-- [ ] Superheat computation from real sensor data (BME280 is currently logged
-      but not yet part of the control loop)
