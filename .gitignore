@@ -17,3 +17,6 @@ Thumbs.db
 
 # OMC session state
 .omc/
+
+# Live-plot run logs
+tools/logs/
