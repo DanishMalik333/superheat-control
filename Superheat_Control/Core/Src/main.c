@@ -18,13 +18,13 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "pid.h"
-#include <stdio.h>
-#include <string.h>
+#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "pid.h"
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -52,6 +52,7 @@ typedef int32_t BME280_S32_t;
 #define PID_OUT_MAX   0.9
 
 #define LINK_RX_BUF_LEN   32
+#define SETPOINT_DEGC     10.0 /* placeholder until superheat is computed */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -65,6 +66,37 @@ SPI_HandleTypeDef hspi1;
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
+/* Definitions for LinkTask */
+osThreadId_t LinkTaskHandle;
+const osThreadAttr_t LinkTask_attributes = {
+  .name = "LinkTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+/* Definitions for SensorTask */
+osThreadId_t SensorTaskHandle;
+const osThreadAttr_t SensorTask_attributes = {
+  .name = "SensorTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for ControlTask */
+osThreadId_t ControlTaskHandle;
+const osThreadAttr_t ControlTask_attributes = {
+  .name = "ControlTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for SimTempQueue */
+osMessageQueueId_t SimTempQueueHandle;
+const osMessageQueueAttr_t SimTempQueue_attributes = {
+  .name = "SimTempQueue"
+};
+/* Definitions for ValveOutputQueue */
+osMessageQueueId_t ValveOutputQueueHandle;
+const osMessageQueueAttr_t ValveOutputQueue_attributes = {
+  .name = "ValveOutputQueue"
+};
 /* USER CODE BEGIN PV */
 static uint16_t dig_T1;
 static int16_t  dig_T2;
@@ -80,6 +112,11 @@ static uint8_t link_rx_byte;
 static char link_rx_line[LINK_RX_BUF_LEN];
 static volatile uint16_t link_rx_len = 0;
 static volatile uint8_t link_rx_line_ready = 0;
+
+/* Latest BME280 reading, written by SensorTask and only read by ControlTask
+ * for logging - not yet part of the control loop, so a plain volatile is
+ * enough (single writer, single reader, one double-word value). */
+static volatile double latest_bme280_degC = 0.0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -88,12 +125,31 @@ static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_USART1_UART_Init(void);
+void StartLinkTask(void *argument);
+void StartSensorTask(void *argument);
+void StartControlTask(void *argument);
+
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+  (void)xTask;
+  printf("!!! STACK OVERFLOW in task: %s\r\n", pcTaskName);
+  __disable_irq();
+  for (;;) { }
+}
+
+void vApplicationMallocFailedHook(void)
+{
+  printf("!!! FreeRTOS heap allocation failed (out of heap)\r\n");
+  __disable_irq();
+  for (;;) { }
+}
+
 static uint8_t BME280_ReadRegister(uint8_t reg)
 {
   uint8_t tx = reg | BME280_READ_BIT;
@@ -217,6 +273,8 @@ static int Link_ReceiveLine(unsigned long *tick, double *value)
     {
       return 0;
     }
+
+    osDelay(1);
   }
 
   int ok = (link_rx_len > 0) && (sscanf(link_rx_line, "%lu,%lf", tick, value) == 2);
@@ -281,50 +339,62 @@ int main(void)
 
   PID_Init(&pid, PID_KP, PID_KI, PID_TS, PID_OUT_MIN, PID_OUT_MAX);
 
-  double temperature_degC = 0.0;
-  double setpoint_degC = 10.0; /* placeholder until superheat is computed */
-
-  /* PID's measurement comes from Board 1's simulated plant, not the BME280. */
-  unsigned long tick = 0;
-  double simulated_temp = 0.0;
-  double valve_output = PID_OUT_MIN;
-
   printf("tick,bme280_degC,plant_degC,valve,setpoint_degC\r\n");
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* Create the queue(s) */
+  /* creation of SimTempQueue */
+  SimTempQueueHandle = osMessageQueueNew (1, sizeof(double), &SimTempQueue_attributes);
+
+  /* creation of ValveOutputQueue */
+  ValveOutputQueueHandle = osMessageQueueNew (1, sizeof(double), &ValveOutputQueue_attributes);
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of LinkTask */
+  LinkTaskHandle = osThreadNew(StartLinkTask, NULL, &LinkTask_attributes);
+
+  /* creation of SensorTask */
+  SensorTaskHandle = osThreadNew(StartSensorTask, NULL, &SensorTask_attributes);
+
+  /* creation of ControlTask */
+  ControlTaskHandle = osThreadNew(StartControlTask, NULL, &ControlTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* Forced mode powers down after one measurement; re-trigger each cycle */
-    BME280_WriteRegister(BME280_REG_CTRL_MEAS, 0x25);
-    HAL_Delay(10); /* allow conversion to complete */
-
-    BME280_S32_t adc_T = BME280_ReadRawTemperature();
-    temperature_degC = BME280_CompensateTemperature(adc_T);
-
-    /* Exchange valve_output for the plant's simulated temp; hold last value on a missed frame. */
-    unsigned long echoed_tick = 0;
-    double received_temp = 0.0;
-
-    Link_SendLine(tick, valve_output);
-
-    if (Link_ReceiveLine(&echoed_tick, &received_temp))
-    {
-      simulated_temp = received_temp;
-    }
-    else
-    {
-      printf("# HIL link: malformed/missing frame, holding last simulated_temp\r\n");
-    }
-
-    valve_output = PID_Update(&pid, setpoint_degC, simulated_temp);
-
-    printf("%lu,%.2f,%.4f,%.3f,%.2f\r\n",
-           tick, temperature_degC, simulated_temp, valve_output, setpoint_degC);
-
-    tick++;
-    HAL_Delay(1000);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -417,39 +487,6 @@ static void MX_SPI1_Init(void)
 }
 
 /**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART2_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART2_Init 0 */
-
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
-
-}
-
-/**
   * @brief USART1 Initialization Function
   * @param None
   * @retval None
@@ -479,6 +516,39 @@ static void MX_USART1_UART_Init(void)
   /* USER CODE BEGIN USART1_Init 2 */
 
   /* USER CODE END USART1_Init 2 */
+
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART2_Init 0 */
+
+  /* USER CODE END USART2_Init 0 */
+
+  /* USER CODE BEGIN USART2_Init 1 */
+
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART2_Init 2 */
+
+  /* USER CODE END USART2_Init 2 */
 
 }
 
@@ -524,6 +594,103 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartLinkTask */
+/**
+  * @brief  Function implementing the LinkTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartLinkTask */
+void StartLinkTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  unsigned long tick = 0;
+  double valve_output = PID_OUT_MIN;
+
+  for(;;)
+  {
+    /* Pick up the latest valve output computed by ControlTask, if any new
+     * one is available; otherwise keep sending the last known value. */
+    osMessageQueueGet(ValveOutputQueueHandle, &valve_output, NULL, 0);
+
+    unsigned long echoed_tick = 0;
+    double received_temp = 0.0;
+
+    Link_SendLine(tick, valve_output);
+
+    if (Link_ReceiveLine(&echoed_tick, &received_temp))
+    {
+      osMessageQueueReset(SimTempQueueHandle);
+      osMessageQueuePut(SimTempQueueHandle, &received_temp, 0, 0);
+    }
+    else
+    {
+      printf("# HIL link: malformed/missing frame, holding last simulated_temp\r\n");
+    }
+
+    tick++;
+    osDelay(1000);
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartSensorTask */
+/**
+* @brief Function implementing the SensorTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartSensorTask */
+void StartSensorTask(void *argument)
+{
+  /* USER CODE BEGIN StartSensorTask */
+  for(;;)
+  {
+    /* Forced mode powers down after one measurement; re-trigger each cycle */
+    BME280_WriteRegister(BME280_REG_CTRL_MEAS, 0x25);
+    osDelay(10); /* allow conversion to complete */
+
+    BME280_S32_t adc_T = BME280_ReadRawTemperature();
+    latest_bme280_degC = BME280_CompensateTemperature(adc_T);
+
+    osDelay(990); /* sample once per second overall */
+  }
+  /* USER CODE END StartSensorTask */
+}
+
+/* USER CODE BEGIN Header_StartControlTask */
+/**
+* @brief Function implementing the ControlTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartControlTask */
+void StartControlTask(void *argument)
+{
+  /* USER CODE BEGIN StartControlTask */
+  unsigned long tick = 0;
+  double simulated_temp = 0.0;
+
+  for(;;)
+  {
+    /* Use the latest simulated temp from LinkTask if a new one arrived
+     * since last cycle; otherwise hold the previous value. */
+    osMessageQueueGet(SimTempQueueHandle, &simulated_temp, NULL, 0);
+
+    double valve_output = PID_Update(&pid, SETPOINT_DEGC, simulated_temp);
+
+    osMessageQueueReset(ValveOutputQueueHandle);
+    osMessageQueuePut(ValveOutputQueueHandle, &valve_output, 0, 0);
+
+    printf("%lu,%.2f,%.4f,%.3f,%.2f\r\n",
+           tick, latest_bme280_degC, simulated_temp, valve_output, SETPOINT_DEGC);
+
+    tick++;
+    osDelay(1000);
+  }
+  /* USER CODE END StartControlTask */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
