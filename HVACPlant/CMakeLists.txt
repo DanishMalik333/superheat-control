@@ -68,7 +68,8 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     # Add user defined libraries
 )
 
-# Enable float support in newlib-nano's printf
+# Enable float support in newlib-nano's printf/scanf
 target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
-    -u _printf_float
+    "-Wl,-u,_printf_float"
+    "-Wl,-u,_scanf_float"
 )

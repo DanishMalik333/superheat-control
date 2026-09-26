@@ -77,10 +77,8 @@ static int Link_ReceiveLine(unsigned long *tick, double *value)
 
   while (len < LINK_RX_BUF_LEN - 1)
   {
-    HAL_StatusTypeDef st = HAL_UART_Receive(&huart1, &ch, 1, 500);
-    if (st != HAL_OK)
+    if (HAL_UART_Receive(&huart1, &ch, 1, 500) != HAL_OK)
     {
-      printf("RX status=%d\r\n", (int)st);
       return 0;
     }
 
@@ -111,8 +109,7 @@ static void Link_SendLine(unsigned long tick, double value)
   char out[LINK_RX_BUF_LEN];
   int n = snprintf(out, sizeof(out), "%lu,%.4f\r\n", tick, value);
 
-  HAL_StatusTypeDef st = HAL_UART_Transmit(&huart1, (uint8_t *)out, (uint16_t)n, 100);
-  printf("TX status=%d bytes=%d payload=%s", (int)st, n, out);
+  HAL_UART_Transmit(&huart1, (uint8_t *)out, (uint16_t)n, 100);
 }
 /* USER CODE END 0 */
 
