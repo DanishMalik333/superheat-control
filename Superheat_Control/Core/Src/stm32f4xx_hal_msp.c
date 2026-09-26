@@ -70,9 +70,11 @@ void HAL_MspInit(void)
   __HAL_RCC_PWR_CLK_ENABLE();
 
   /* System interrupt init*/
+  /* PendSV_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(PendSV_IRQn, 15, 0);
 
   /* USER CODE BEGIN MspInit 1 */
-
+  HAL_NVIC_SetPriorityGrouping(NVIC_PRIORITYGROUP_4);
   /* USER CODE END MspInit 1 */
 }
 
@@ -169,15 +171,16 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     GPIO_InitStruct.Pin = GPIO_PIN_9|GPIO_PIN_10;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* USER CODE BEGIN USART1_MspInit 1 */
+    /* USART1 interrupt Init */
     HAL_NVIC_SetPriority(USART1_IRQn, 5, 0);
     HAL_NVIC_EnableIRQ(USART1_IRQn);
-    /* USER CODE END USART1_MspInit 1 */
+    /* USER CODE BEGIN USART1_MspInit 1 */
 
+    /* USER CODE END USART1_MspInit 1 */
   }
   else if(huart->Instance==USART2)
   {
@@ -202,7 +205,6 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     /* USER CODE BEGIN USART2_MspInit 1 */
 
     /* USER CODE END USART2_MspInit 1 */
-
   }
 
 }
@@ -229,8 +231,10 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
     */
     HAL_GPIO_DeInit(GPIOA, GPIO_PIN_9|GPIO_PIN_10);
 
-    /* USER CODE BEGIN USART1_MspDeInit 1 */
+    /* USART1 interrupt DeInit */
     HAL_NVIC_DisableIRQ(USART1_IRQn);
+    /* USER CODE BEGIN USART1_MspDeInit 1 */
+
     /* USER CODE END USART1_MspDeInit 1 */
   }
   else if(huart->Instance==USART2)
