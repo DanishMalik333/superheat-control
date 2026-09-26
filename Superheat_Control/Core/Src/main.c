@@ -71,6 +71,15 @@ static int16_t  dig_T2;
 static int16_t  dig_T3;
 static BME280_S32_t t_fine;
 static PID_t pid;
+
+/* Interrupt-driven USART1 line reception. HAL_UART_Receive_IT is re-armed for
+ * one byte at a time from the RxCpltCallback, so incoming bytes are captured
+ * by the peripheral/ISR regardless of what the main loop is doing, avoiding
+ * the overrun that polling HAL_UART_Receive suffered from. */
+static uint8_t link_rx_byte;
+static char link_rx_line[LINK_RX_BUF_LEN];
+static volatile uint16_t link_rx_len = 0;
+static volatile uint8_t link_rx_line_ready = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -160,40 +169,62 @@ int __io_putchar(int ch)
   return ch;
 }
 
-/* Reads one "<tick>,<value>\r\n" line from USART1. Returns 1 on success. */
+/* Called from USART1_IRQHandler via HAL_UART_IRQHandler whenever one byte has
+ * been received. Assembles line_rx_line and re-arms the next single-byte
+ * receive so bytes are never missed while the main loop is busy elsewhere. */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance != USART1)
+  {
+    return;
+  }
+
+  uint8_t ch = link_rx_byte;
+
+  if (!link_rx_line_ready)
+  {
+    if (ch == '\n')
+    {
+      link_rx_line[link_rx_len] = '\0';
+      link_rx_line_ready = 1;
+    }
+    else if (ch != '\r')
+    {
+      if (link_rx_len < LINK_RX_BUF_LEN - 1)
+      {
+        link_rx_line[link_rx_len++] = (char)ch;
+      }
+      else
+      {
+        /* Line too long: drop it and resync on the next '\n'. */
+        link_rx_len = 0;
+      }
+    }
+  }
+
+  HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
+}
+
+/* Waits (with a timeout) for HAL_UART_RxCpltCallback to assemble one
+ * "<tick>,<value>\r\n" line from USART1. Returns 1 on success. */
 static int Link_ReceiveLine(unsigned long *tick, double *value)
 {
-  static char buf[LINK_RX_BUF_LEN];
-  uint16_t len = 0;
-  uint8_t ch = 0;
+  uint32_t start = HAL_GetTick();
 
-  while (len < LINK_RX_BUF_LEN - 1)
+  while (!link_rx_line_ready)
   {
-    if (HAL_UART_Receive(&huart1, &ch, 1, 500) != HAL_OK)
+    if ((HAL_GetTick() - start) > 500)
     {
       return 0;
     }
-
-    if (ch == '\n')
-    {
-      buf[len] = '\0';
-      break;
-    }
-
-    if (ch != '\r')
-    {
-      buf[len++] = (char)ch;
-    }
   }
 
-  if (len == 0 || len >= LINK_RX_BUF_LEN - 1)
-  {
-    return 0;
-  }
+  int ok = (link_rx_len > 0) && (sscanf(link_rx_line, "%lu,%lf", tick, value) == 2);
 
-  buf[len] = '\0';
+  link_rx_len = 0;
+  link_rx_line_ready = 0;
 
-  return sscanf(buf, "%lu,%lf", tick, value) == 2;
+  return ok;
 }
 
 static void Link_SendLine(unsigned long tick, double value)
@@ -238,7 +269,10 @@ int main(void)
   MX_SPI1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
+
   uint8_t chip_id = BME280_ReadRegister(BME280_REG_CHIP_ID);
+  printf("# BME280 chip_id=0x%02X (expect 0x%02X)\r\n", chip_id, BME280_CHIP_ID_VALUE);
 
   BME280_ReadCalibrationData();
 
@@ -254,6 +288,8 @@ int main(void)
   unsigned long tick = 0;
   double simulated_temp = 0.0;
   double valve_output = PID_OUT_MIN;
+
+  printf("tick,bme280_degC,plant_degC,valve,setpoint_degC\r\n");
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -279,13 +315,13 @@ int main(void)
     }
     else
     {
-      printf("HIL link: malformed/missing frame, holding last simulated_temp\r\n");
+      printf("# HIL link: malformed/missing frame, holding last simulated_temp\r\n");
     }
 
     valve_output = PID_Update(&pid, setpoint_degC, simulated_temp);
 
-    printf("tick=%lu BME280=%.2f DegC (logged only), Plant=%.4f, Valve=%.3f\r\n",
-           tick, temperature_degC, simulated_temp, valve_output);
+    printf("%lu,%.2f,%.4f,%.3f,%.2f\r\n",
+           tick, temperature_degC, simulated_temp, valve_output, setpoint_degC);
 
     tick++;
     HAL_Delay(1000);

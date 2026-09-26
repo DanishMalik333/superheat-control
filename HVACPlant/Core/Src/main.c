@@ -49,6 +49,15 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 static Plant_t plant;
+
+/* Interrupt-driven USART1 line reception. HAL_UART_Receive_IT is re-armed for
+ * one byte at a time from the RxCpltCallback, so incoming bytes are captured
+ * by the peripheral/ISR regardless of what the main loop is doing, avoiding
+ * the overrun that polling HAL_UART_Receive suffered from. */
+static uint8_t link_rx_byte;
+static char link_rx_line[LINK_RX_BUF_LEN];
+static volatile uint16_t link_rx_len = 0;
+static volatile uint8_t link_rx_line_ready = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -68,40 +77,62 @@ int __io_putchar(int ch)
   return ch;
 }
 
-/* Reads one "<tick>,<value>\r\n" line from USART1. Returns 1 on success. */
+/* Called from USART1_IRQHandler via HAL_UART_IRQHandler whenever one byte has
+ * been received. Assembles link_rx_line and re-arms the next single-byte
+ * receive so bytes are never missed while the main loop is busy elsewhere. */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance != USART1)
+  {
+    return;
+  }
+
+  uint8_t ch = link_rx_byte;
+
+  if (!link_rx_line_ready)
+  {
+    if (ch == '\n')
+    {
+      link_rx_line[link_rx_len] = '\0';
+      link_rx_line_ready = 1;
+    }
+    else if (ch != '\r')
+    {
+      if (link_rx_len < LINK_RX_BUF_LEN - 1)
+      {
+        link_rx_line[link_rx_len++] = (char)ch;
+      }
+      else
+      {
+        /* Line too long: drop it and resync on the next '\n'. */
+        link_rx_len = 0;
+      }
+    }
+  }
+
+  HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
+}
+
+/* Waits (with a timeout) for HAL_UART_RxCpltCallback to assemble one
+ * "<tick>,<value>\r\n" line from USART1. Returns 1 on success. */
 static int Link_ReceiveLine(unsigned long *tick, double *value)
 {
-  static char buf[LINK_RX_BUF_LEN];
-  uint16_t len = 0;
-  uint8_t ch = 0;
+  uint32_t start = HAL_GetTick();
 
-  while (len < LINK_RX_BUF_LEN - 1)
+  while (!link_rx_line_ready)
   {
-    if (HAL_UART_Receive(&huart1, &ch, 1, 500) != HAL_OK)
+    if ((HAL_GetTick() - start) > 500)
     {
       return 0;
     }
-
-    if (ch == '\n')
-    {
-      buf[len] = '\0';
-      break;
-    }
-
-    if (ch != '\r')
-    {
-      buf[len++] = (char)ch;
-    }
   }
 
-  if (len == 0 || len >= LINK_RX_BUF_LEN - 1)
-  {
-    return 0;
-  }
+  int ok = (link_rx_len > 0) && (sscanf(link_rx_line, "%lu,%lf", tick, value) == 2);
 
-  buf[len] = '\0';
+  link_rx_len = 0;
+  link_rx_line_ready = 0;
 
-  return sscanf(buf, "%lu,%lf", tick, value) == 2;
+  return ok;
 }
 
 static void Link_SendLine(unsigned long tick, double value)
@@ -145,6 +176,8 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
+  HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
+
   Plant_Init(&plant, PLANT_NUM, PLANT_DEN, LINK_INITIAL_Y);
 
   printf("HVACPlant: plant simulator ready (num=%.6f, den=%.6f, Ts=%.2fs)\r\n",
