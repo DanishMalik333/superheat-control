@@ -25,7 +25,7 @@
 #include "pid.h"
 #include "bme280.h"
 #include "i2c1_bus.h"
-#include "lcd1602.h"
+#include "lcd2004.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -557,48 +557,51 @@ static void rtos_delay_ms(uint32_t ms)
   osDelay(ms); /* configTICK_RATE_HZ is 1000, so ticks == ms */
 }
 
-/* Shows the live loop state on the 16x2 LCD:
- *   SH:10.2 SP:10.0      superheat and setpoint, degC
- *   V: 50%  Amb:23.4     valve opening and BME280 ambient, degC
+/* One LCD row as a label, a right-aligned value and a unit, e.g.
+ * "Superheat   10.2 °C". NaN (no data yet) shows as "--.-". */
+static void DisplayRow(uint8_t row, const char *label, float value, const char *unit)
+{
+  char line[LCD2004_COLS + 1];
+
+  if (isnan(value))
+  {
+    snprintf(line, sizeof(line), "%-10s  --.- %s", label, unit);
+  }
+  else
+  {
+    snprintf(line, sizeof(line), "%-10s%6.1f %s", label, (double)value, unit);
+  }
+  LCD2004_WriteLine(row, line);
+}
+
+/* Shows the live loop state on the 20x4 LCD:
+ *   Superheat   10.2 °C
+ *   Setpoint    10.0 °C
+ *   Valve       50.0 %
+ *   Ambient     23.4 °C
  * Lowest-priority task, since the display is for the operator only and must
  * never delay the control or link tasks. */
 static void StartDisplayTask(void *argument)
 {
   (void)argument;
-  char line[LCD1602_COLS + 1];
+  /* 0xDF is the degree sign in the HD44780's A00 character ROM. Kept as a
+   * separate literal so the hex escape doesn't swallow the 'C'. */
+  static const char deg_c[] = "\xDF" "C";
 
-  if (LCD1602_Init(rtos_delay_ms) != 0)
+  if (LCD2004_Init(rtos_delay_ms) != 0)
   {
-    printf("# LCD not found at I2C address 0x%02X - display disabled\r\n", LCD1602_I2C_ADDR);
+    printf("# LCD not found at I2C address 0x%02X - display disabled\r\n", LCD2004_I2C_ADDR);
     osThreadExit();
   }
 
   for (;;)
   {
-    float superheat = display_superheat_degC;
     float valve = display_valve;
-    float ambient = latest_bme280_degC;
 
-    if (isnan(superheat))
-    {
-      snprintf(line, sizeof(line), "SH:--.- SP:%.1f", SETPOINT_DEGC);
-    }
-    else
-    {
-      snprintf(line, sizeof(line), "SH:%.1f SP:%.1f", (double)superheat, SETPOINT_DEGC);
-    }
-    LCD1602_WriteLine(0, line);
-
-    if (isnan(ambient))
-    {
-      snprintf(line, sizeof(line), "V:%3.0f%%  Amb:--.-", isnan(valve) ? 0.0 : (double)valve * 100.0);
-    }
-    else
-    {
-      snprintf(line, sizeof(line), "V:%3.0f%%  Amb:%.1f", isnan(valve) ? 0.0 : (double)valve * 100.0,
-               (double)ambient);
-    }
-    LCD1602_WriteLine(1, line);
+    DisplayRow(0, "Superheat", display_superheat_degC, deg_c);
+    DisplayRow(1, "Setpoint", (float)SETPOINT_DEGC, deg_c);
+    DisplayRow(2, "Valve", isnan(valve) ? valve : valve * 100.0f, "%");
+    DisplayRow(3, "Ambient", latest_bme280_degC, deg_c);
 
     osDelay(500);
   }

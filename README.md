@@ -19,7 +19,7 @@ steady state. Captured live from Board 1's UART debug stream — see
 | Folder | `Superheat_Control/` | `HVACPlant/` |
 | Role | Runs the discrete PID loop, measures real ambient temperature, drives the LCD | Runs a discretized transfer-function model of the refrigeration plant |
 | Sensor | BME280 over SPI1 *or* I2C1 (build option) — ambient temperature, fed to the plant as a load disturbance | None |
-| Display | 16x2 HD44780 LCD with PCF8574 I2C backpack (I2C1) | None |
+| Display | 20x4 HD44780 LCD (2004A) with PCF8574 I2C backpack (I2C1) | None |
 | Debug output | USART2 → ST-LINK VCP (CSV telemetry) | USART2 → ST-LINK VCP (per-tick log) |
 | Inter-board link | USART1 (PA9/PA10), master side | USART1 (PA9/PA10), replies to each frame |
 
@@ -35,7 +35,7 @@ flowchart LR
     subgraph Board1["Board 1 — Controller"]
         BME280["BME280\n(SPI1 or I2C1)"]
         PID["Discrete PID\npid.c"]
-        LCD["16x2 LCD\n(I2C1)"]
+        LCD["20x4 LCD\n(I2C1)"]
     end
 
     subgraph Board2["Board 2 — Plant Simulator"]
@@ -104,13 +104,19 @@ The startup log reports which bus is in use (`# BME280 over I2C, chip_id=0x60`).
 
 ## LCD display
 
-A 16x2 HD44780 character LCD on a PCF8574 I2C backpack (`lcd1602.c`) shows
+A 20x4 HD44780 character LCD (2004A) on a PCF8574 I2C backpack (`lcd2004.c`) shows
 the live loop state, refreshed every 500 ms:
 
 ```
-SH:10.2 SP:10.0     superheat and setpoint, °C
-V: 50%  Amb:23.4    valve opening and ambient, °C
+Superheat   10.2 °C
+Setpoint    10.0 °C
+Valve       50.0 %
+Ambient     23.4 °C
 ```
+
+Values that aren't available yet (no reply from Board 2, or no BME280) show
+as `--.-`. The 20x4 panel is addressed as two 40-character HD44780 lines
+split in half, so rows 0-3 start at DDRAM 0x00, 0x40, 0x14 and 0x54.
 
 The HD44780 runs in 4-bit mode: the PCF8574's eight outputs carry one data
 nibble plus RS/RW/EN/backlight, and data is latched on EN's falling edge, so
