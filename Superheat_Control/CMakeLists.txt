@@ -47,7 +47,36 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/pid.c
     Core/Src/plant.c
+    Core/Src/bme280.c
+    Core/Src/i2c1_bus.c
+    Core/Src/lcd1602.c
+    Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_i2c.c
+    Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_i2c_ex.c
 )
+
+# I2C1 (PB8/PB9) drives the LCD and, optionally, the BME280. It isn't enabled
+# in the .ioc, so the HAL I2C module is switched on here rather than in
+# stm32f4xx_hal_conf.h, which CubeMX regenerates.
+target_compile_definitions(stm32cubemx INTERFACE HAL_I2C_MODULE_ENABLED)
+
+# BME280 bus selection: configure with -DBME280_BUS=I2C to read the sensor
+# over the shared I2C1 bus instead of SPI1. The driver in bme280.c is the same
+# for both; only the bus file changes.
+set(BME280_BUS "SPI" CACHE STRING "Bus used to talk to the BME280 (SPI or I2C)")
+set_property(CACHE BME280_BUS PROPERTY STRINGS SPI I2C)
+message("BME280 bus: " ${BME280_BUS})
+
+if(BME280_BUS STREQUAL "I2C")
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+        Core/Src/bme280_bus_i2c.c
+    )
+elseif(BME280_BUS STREQUAL "SPI")
+    target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+        Core/Src/bme280_bus_spi.c
+    )
+else()
+    message(FATAL_ERROR "BME280_BUS must be SPI or I2C, got '${BME280_BUS}'")
+endif()
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE

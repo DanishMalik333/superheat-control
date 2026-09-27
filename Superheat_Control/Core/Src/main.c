@@ -23,6 +23,10 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "pid.h"
+#include "bme280.h"
+#include "i2c1_bus.h"
+#include "lcd1602.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 /* USER CODE END Includes */
@@ -34,17 +38,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define BME280_REG_CHIP_ID      0xD0
-#define BME280_CHIP_ID_VALUE    0x60
-#define BME280_READ_BIT         0x80
-
-#define BME280_REG_CALIB_T_START 0x88 /* dig_T1..dig_T3, 6 bytes */
-#define BME280_REG_CTRL_MEAS    0xF4
-#define BME280_REG_CONFIG       0xF5
-#define BME280_REG_TEMP_MSB     0xFA /* temp_msb, temp_lsb, temp_xlsb, 3 bytes */
-
-typedef int32_t BME280_S32_t;
-
 #define PID_KP        0.1
 #define PID_KI        0.015
 #define PID_TS        1.0
@@ -98,10 +91,6 @@ const osMessageQueueAttr_t ValveOutputQueue_attributes = {
   .name = "ValveOutputQueue"
 };
 /* USER CODE BEGIN PV */
-static uint16_t dig_T1;
-static int16_t  dig_T2;
-static int16_t  dig_T3;
-static BME280_S32_t t_fine;
 static PID_t pid;
 
 /* Interrupt-driven USART1 line reception. HAL_UART_Receive_IT is re-armed for
@@ -113,10 +102,28 @@ static char link_rx_line[LINK_RX_BUF_LEN];
 static volatile uint16_t link_rx_len = 0;
 static volatile uint8_t link_rx_line_ready = 0;
 
-/* Latest BME280 reading, written by SensorTask and only read by ControlTask
- * for logging - not yet part of the control loop, so a plain volatile is
- * enough (single writer, single reader, one double-word value). */
-static volatile double latest_bme280_degC = 0.0;
+/* Latest BME280 ambient reading, written by SensorTask and read by LinkTask
+ * (sent to Board 2 as the plant's load disturbance) and ControlTask (logged).
+ * Kept as a float rather than a double on purpose: an aligned 32-bit load or
+ * store is a single atomic access on the Cortex-M4, so readers can never see
+ * a half-written value and no mutex is needed. NAN means "no valid reading"
+ * (sensor missing or bus error), in which case Board 2 is sent no ambient. */
+static volatile float latest_bme280_degC = NAN;
+static int bme280_ok = 0;
+
+/* Latest loop values for the LCD, written by ControlTask and read by
+ * DisplayTask. Floats for the same single-access atomicity reason as above. */
+static volatile float display_superheat_degC = NAN;
+static volatile float display_valve = NAN;
+
+/* DisplayTask is created in the RTOS_THREADS user section rather than through
+ * CubeMX, so its definition lives here instead of in the generated block. */
+osThreadId_t DisplayTaskHandle;
+const osThreadAttr_t DisplayTask_attributes = {
+  .name = "DisplayTask",
+  .stack_size = 512 * 4, /* snprintf float formatting is stack-heavy */
+  .priority = (osPriority_t) osPriorityBelowNormal,
+};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -130,7 +137,7 @@ void StartSensorTask(void *argument);
 void StartControlTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-
+static void StartDisplayTask(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -148,75 +155,6 @@ void vApplicationMallocFailedHook(void)
   printf("!!! FreeRTOS heap allocation failed (out of heap)\r\n");
   __disable_irq();
   for (;;) { }
-}
-
-static uint8_t BME280_ReadRegister(uint8_t reg)
-{
-  uint8_t tx = reg | BME280_READ_BIT;
-  uint8_t rx = 0;
-
-  HAL_GPIO_WritePin(BME280_CS_GPIO_Port, BME280_CS_Pin, GPIO_PIN_RESET);
-  HAL_SPI_Transmit(&hspi1, &tx, 1, HAL_MAX_DELAY);
-  HAL_SPI_Receive(&hspi1, &rx, 1, HAL_MAX_DELAY);
-  HAL_GPIO_WritePin(BME280_CS_GPIO_Port, BME280_CS_Pin, GPIO_PIN_SET);
-
-  return rx;
-}
-
-static void BME280_ReadBurst(uint8_t startReg, uint8_t *buf, uint16_t len)
-{
-  uint8_t tx = startReg | BME280_READ_BIT;
-
-  HAL_GPIO_WritePin(BME280_CS_GPIO_Port, BME280_CS_Pin, GPIO_PIN_RESET);
-  HAL_SPI_Transmit(&hspi1, &tx, 1, HAL_MAX_DELAY);
-  HAL_SPI_Receive(&hspi1, buf, len, HAL_MAX_DELAY);
-  HAL_GPIO_WritePin(BME280_CS_GPIO_Port, BME280_CS_Pin, GPIO_PIN_SET);
-}
-
-static void BME280_WriteRegister(uint8_t reg, uint8_t value)
-{
-  uint8_t tx[2];
-  tx[0] = reg & ~BME280_READ_BIT; /* MSB cleared = write */
-  tx[1] = value;
-
-  HAL_GPIO_WritePin(BME280_CS_GPIO_Port, BME280_CS_Pin, GPIO_PIN_RESET);
-  HAL_SPI_Transmit(&hspi1, tx, 2, HAL_MAX_DELAY);
-  HAL_GPIO_WritePin(BME280_CS_GPIO_Port, BME280_CS_Pin, GPIO_PIN_SET);
-}
-
-static void BME280_ReadCalibrationData(void)
-{
-  uint8_t buf[6];
-
-  BME280_ReadBurst(BME280_REG_CALIB_T_START, buf, 6);
-
-  dig_T1 = (uint16_t)((buf[1] << 8) | buf[0]);
-  dig_T2 = (int16_t)((buf[3] << 8) | buf[2]);
-  dig_T3 = (int16_t)((buf[5] << 8) | buf[4]);
-}
-
-/* Returns temperature in DegC, double precision. Output value of "51.23" equals 51.23 DegC. */
-static double BME280_CompensateTemperature(BME280_S32_t adc_T)
-{
-  double var1, var2, T;
-
-  var1 = (((double)adc_T) / 16384.0 - ((double)dig_T1) / 1024.0) * ((double)dig_T2);
-  var2 = ((((double)adc_T) / 131072.0 - ((double)dig_T1) / 8192.0) *
-          (((double)adc_T) / 131072.0 - ((double)dig_T1) / 8192.0)) * ((double)dig_T3);
-
-  t_fine = (BME280_S32_t)(var1 + var2);
-  T = (var1 + var2) / 5120.0;
-  return T;
-}
-
-static BME280_S32_t BME280_ReadRawTemperature(void)
-{
-  uint8_t buf[3];
-
-  BME280_ReadBurst(BME280_REG_TEMP_MSB, buf, 3);
-
-  /* temp_msb:temp_lsb:temp_xlsb[7:4] packed into a 20-bit raw value */
-  return (BME280_S32_t)(((uint32_t)buf[0] << 12) | ((uint32_t)buf[1] << 4) | (buf[2] >> 4));
 }
 
 int __io_putchar(int ch)
@@ -285,10 +223,27 @@ static int Link_ReceiveLine(unsigned long *tick, double *value)
   return ok;
 }
 
-static void Link_SendLine(unsigned long tick, double value)
+/* Sends "<tick>,<valve>,<ambient>\r\n" to Board 2, or "<tick>,<valve>\r\n"
+ * when there is no valid ambient reading - Board 2 then holds the last
+ * disturbance it received. */
+static void Link_SendLine(unsigned long tick, double value, float ambient_degC)
 {
   char out[LINK_RX_BUF_LEN];
-  int n = snprintf(out, sizeof(out), "%lu,%.4f\r\n", tick, value);
+  int n;
+
+  if (isnan(ambient_degC))
+  {
+    n = snprintf(out, sizeof(out), "%lu,%.4f\r\n", tick, value);
+  }
+  else
+  {
+    n = snprintf(out, sizeof(out), "%lu,%.4f,%.2f\r\n", tick, value, (double)ambient_degC);
+  }
+
+  if (n < 0 || n >= (int)sizeof(out))
+  {
+    return; /* would have been truncated - never send a partial frame */
+  }
 
   HAL_UART_Transmit(&huart1, (uint8_t *)out, (uint16_t)n, 100);
 }
@@ -329,13 +284,17 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
 
-  uint8_t chip_id = BME280_ReadRegister(BME280_REG_CHIP_ID);
-  printf("# BME280 chip_id=0x%02X (expect 0x%02X)\r\n", chip_id, BME280_CHIP_ID_VALUE);
-
-  BME280_ReadCalibrationData();
-
-  /* ctrl_meas: osrs_t=001 (x1), osrs_p=000 (skipped), mode=01 (forced) */
-  BME280_WriteRegister(BME280_REG_CTRL_MEAS, 0x25);
+  uint8_t chip_id = 0;
+  bme280_ok = (BME280_Init(&bme280_bus, &chip_id) == 0);
+  if (bme280_ok)
+  {
+    printf("# BME280 over %s, chip_id=0x%02X\r\n", bme280_bus.name, chip_id);
+  }
+  else
+  {
+    printf("# BME280 over %s not found (chip_id=0x%02X, expect 0x%02X) - running without ambient disturbance\r\n",
+           bme280_bus.name, chip_id, BME280_CHIP_ID_VALUE);
+  }
 
   PID_Init(&pid, PID_KP, PID_KI, PID_TS, PID_OUT_MIN, PID_OUT_MAX);
 
@@ -346,7 +305,8 @@ int main(void)
   osKernelInitialize();
 
   /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
+  /* SensorTask (I2C build) and DisplayTask share I2C1 */
+  I2C1_CreateMutex();
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -379,7 +339,7 @@ int main(void)
   ControlTaskHandle = osThreadNew(StartControlTask, NULL, &ControlTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
+  DisplayTaskHandle = osThreadNew(StartDisplayTask, NULL, &DisplayTask_attributes);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -592,7 +552,57 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static void rtos_delay_ms(uint32_t ms)
+{
+  osDelay(ms); /* configTICK_RATE_HZ is 1000, so ticks == ms */
+}
 
+/* Shows the live loop state on the 16x2 LCD:
+ *   SH:10.2 SP:10.0      superheat and setpoint, degC
+ *   V: 50%  Amb:23.4     valve opening and BME280 ambient, degC
+ * Lowest-priority task, since the display is for the operator only and must
+ * never delay the control or link tasks. */
+static void StartDisplayTask(void *argument)
+{
+  (void)argument;
+  char line[LCD1602_COLS + 1];
+
+  if (LCD1602_Init(rtos_delay_ms) != 0)
+  {
+    printf("# LCD not found at I2C address 0x%02X - display disabled\r\n", LCD1602_I2C_ADDR);
+    osThreadExit();
+  }
+
+  for (;;)
+  {
+    float superheat = display_superheat_degC;
+    float valve = display_valve;
+    float ambient = latest_bme280_degC;
+
+    if (isnan(superheat))
+    {
+      snprintf(line, sizeof(line), "SH:--.- SP:%.1f", SETPOINT_DEGC);
+    }
+    else
+    {
+      snprintf(line, sizeof(line), "SH:%.1f SP:%.1f", (double)superheat, SETPOINT_DEGC);
+    }
+    LCD1602_WriteLine(0, line);
+
+    if (isnan(ambient))
+    {
+      snprintf(line, sizeof(line), "V:%3.0f%%  Amb:--.-", isnan(valve) ? 0.0 : (double)valve * 100.0);
+    }
+    else
+    {
+      snprintf(line, sizeof(line), "V:%3.0f%%  Amb:%.1f", isnan(valve) ? 0.0 : (double)valve * 100.0,
+               (double)ambient);
+    }
+    LCD1602_WriteLine(1, line);
+
+    osDelay(500);
+  }
+}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartLinkTask */
@@ -617,7 +627,7 @@ void StartLinkTask(void *argument)
     unsigned long echoed_tick = 0;
     double received_temp = 0.0;
 
-    Link_SendLine(tick, valve_output);
+    Link_SendLine(tick, valve_output, latest_bme280_degC);
 
     if (Link_ReceiveLine(&echoed_tick, &received_temp))
     {
@@ -647,14 +657,29 @@ void StartSensorTask(void *argument)
   /* USER CODE BEGIN StartSensorTask */
   for(;;)
   {
+    if (!bme280_ok)
+    {
+      osDelay(1000); /* no sensor found at startup - nothing to sample */
+      continue;
+    }
+
     /* Forced mode powers down after one measurement; re-trigger each cycle */
-    BME280_WriteRegister(BME280_REG_CTRL_MEAS, 0x25);
-    osDelay(10); /* allow conversion to complete */
+    double temp_degC = 0.0;
+    int ok = (BME280_TriggerMeasurement() == 0);
+    osDelay(BME280_MEAS_TIME_MS); /* allow conversion to complete */
 
-    BME280_S32_t adc_T = BME280_ReadRawTemperature();
-    latest_bme280_degC = BME280_CompensateTemperature(adc_T);
+    if (ok && BME280_ReadTemperature(&temp_degC) == 0)
+    {
+      latest_bme280_degC = (float)temp_degC;
+    }
+    else
+    {
+      /* A bus error invalidates the reading rather than freezing the last
+       * value, so Board 2 stops being fed a stale disturbance. */
+      latest_bme280_degC = NAN;
+    }
 
-    osDelay(990); /* sample once per second overall */
+    osDelay(1000 - BME280_MEAS_TIME_MS); /* sample once per second overall */
   }
   /* USER CODE END StartSensorTask */
 }
@@ -683,8 +708,11 @@ void StartControlTask(void *argument)
     osMessageQueueReset(ValveOutputQueueHandle);
     osMessageQueuePut(ValveOutputQueueHandle, &valve_output, 0, 0);
 
+    display_superheat_degC = (float)simulated_temp;
+    display_valve = (float)valve_output;
+
     printf("%lu,%.2f,%.4f,%.3f,%.2f\r\n",
-           tick, latest_bme280_degC, simulated_temp, valve_output, SETPOINT_DEGC);
+           tick, (double)latest_bme280_degC, simulated_temp, valve_output, SETPOINT_DEGC);
 
     tick++;
     osDelay(1000);

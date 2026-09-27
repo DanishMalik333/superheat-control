@@ -14,6 +14,7 @@ produced afterward from the logged data.
 """
 import argparse
 import csv
+import math
 import os
 import sys
 from collections import deque
@@ -49,8 +50,9 @@ def main():
     plant_temp = deque(maxlen=args.window)
     valve = deque(maxlen=args.window)
     setpoint = deque(maxlen=args.window)
+    ambient = deque(maxlen=args.window)
 
-    fig, (ax_temp, ax_valve) = plt.subplots(2, 1, sharex=True, figsize=(9, 6))
+    fig, (ax_temp, ax_valve, ax_amb) = plt.subplots(3, 1, sharex=True, figsize=(9, 8))
     line_plant, = ax_temp.plot([], [], label="Superheat (simulated plant), °C")
     line_setpoint, = ax_temp.plot([], [], "--", label="Superheat setpoint, °C")
     ax_temp.set_ylabel("Superheat (°C)")
@@ -60,10 +62,15 @@ def main():
 
     line_valve, = ax_valve.plot([], [], color="tab:orange", label="Valve opening, %")
     ax_valve.set_ylabel("Valve opening (%)")
-    ax_valve.set_xlabel("Tick")
     ax_valve.set_ylim(0.0, 100.0)
     ax_valve.legend(loc="upper right")
     ax_valve.grid(True)
+
+    line_amb, = ax_amb.plot([], [], color="tab:red", label="Ambient (BME280, load disturbance), °C")
+    ax_amb.set_ylabel("Ambient (°C)")
+    ax_amb.set_xlabel("Tick")
+    ax_amb.legend(loc="upper right")
+    ax_amb.grid(True)
 
     def read_available_lines():
         rows_added = 0
@@ -90,17 +97,19 @@ def main():
             plant_temp.append(plant)
             valve.append(val * 100.0)
             setpoint.append(sp)
+            ambient.append(bme)  # nan when Board 1 has no valid reading; matplotlib leaves a gap
             rows_added += 1
         return rows_added
 
     def update(_frame):
         read_available_lines()
         if not ticks:
-            return line_plant, line_setpoint, line_valve
+            return line_plant, line_setpoint, line_valve, line_amb
 
         line_plant.set_data(ticks, plant_temp)
         line_setpoint.set_data(ticks, setpoint)
         line_valve.set_data(ticks, valve)
+        line_amb.set_data(ticks, ambient)
 
         ax_temp.set_xlim(ticks[0], max(ticks[-1], ticks[0] + 1))
         ymin = min(min(plant_temp), min(setpoint))
@@ -108,7 +117,12 @@ def main():
         pad = max(0.5, (ymax - ymin) * 0.1)
         ax_temp.set_ylim(ymin - pad, ymax + pad)
 
-        return line_plant, line_setpoint, line_valve
+        valid_amb = [a for a in ambient if not math.isnan(a)]
+        if valid_amb:
+            amb_pad = max(0.5, (max(valid_amb) - min(valid_amb)) * 0.1)
+            ax_amb.set_ylim(min(valid_amb) - amb_pad, max(valid_amb) + amb_pad)
+
+        return line_plant, line_setpoint, line_valve, line_amb
 
     ani = FuncAnimation(fig, update, interval=300, cache_frame_data=False)
 
