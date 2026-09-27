@@ -1,4 +1,4 @@
-#include "lcd1602.h"
+#include "lcd2004.h"
 #include "i2c1_bus.h"
 
 /* PCF8574 pin -> HD44780 mapping used by the common backpack boards:
@@ -14,7 +14,9 @@
 #define LCD_CMD_FUNCTION_4BIT   0x28 /* 4-bit bus, 2 lines, 5x8 font */
 #define LCD_CMD_SET_DDRAM       0x80
 
-static const uint8_t row_offsets[LCD1602_ROWS] = { 0x00, 0x40 };
+/* A 20x4 panel is wired as two 40-char HD44780 lines, each split in half:
+ * rows 2 and 3 are the second halves of rows 0 and 1 in DDRAM. */
+static const uint8_t row_offsets[LCD2004_ROWS] = { 0x00, 0x40, 0x14, 0x54 };
 
 static void (*lcd_delay_ms)(uint32_t ms);
 
@@ -29,7 +31,7 @@ static int lcd_send_byte(uint8_t value, uint8_t mode)
   uint8_t lo = (uint8_t)((value << 4) & 0xF0) | mode | LCD_BACKLIGHT;
   uint8_t frame[4] = { hi | LCD_EN, hi, lo | LCD_EN, lo };
 
-  return I2C1_Transmit(LCD1602_I2C_ADDR, frame, sizeof(frame));
+  return I2C1_Transmit(LCD2004_I2C_ADDR, frame, sizeof(frame));
 }
 
 /* Used only during init, while the controller may still be in 8-bit mode
@@ -39,7 +41,7 @@ static int lcd_send_nibble(uint8_t nibble)
   uint8_t bits = (uint8_t)((nibble << 4) & 0xF0) | LCD_BACKLIGHT;
   uint8_t frame[2] = { bits | LCD_EN, bits };
 
-  return I2C1_Transmit(LCD1602_I2C_ADDR, frame, sizeof(frame));
+  return I2C1_Transmit(LCD2004_I2C_ADDR, frame, sizeof(frame));
 }
 
 static int lcd_command(uint8_t cmd)
@@ -51,7 +53,7 @@ static int lcd_command(uint8_t cmd)
  * instruction", 4-bit interface): three 0x3 nibbles force a known 8-bit
  * state whatever mode the controller woke up in, then 0x2 switches to
  * 4-bit mode. */
-int LCD1602_Init(void (*delay_ms)(uint32_t ms))
+int LCD2004_Init(void (*delay_ms)(uint32_t ms))
 {
   lcd_delay_ms = delay_ms;
 
@@ -81,19 +83,19 @@ int LCD1602_Init(void (*delay_ms)(uint32_t ms))
     return -1;
   }
 
-  return LCD1602_Clear();
+  return LCD2004_Clear();
 }
 
-int LCD1602_Clear(void)
+int LCD2004_Clear(void)
 {
   int status = lcd_command(LCD_CMD_CLEAR);
   lcd_delay_ms(2); /* clear takes 1.52 ms, far longer than other commands */
   return status;
 }
 
-int LCD1602_WriteLine(uint8_t row, const char *text)
+int LCD2004_WriteLine(uint8_t row, const char *text)
 {
-  if (row >= LCD1602_ROWS)
+  if (row >= LCD2004_ROWS)
   {
     return -1;
   }
@@ -103,7 +105,7 @@ int LCD1602_WriteLine(uint8_t row, const char *text)
     return -1;
   }
 
-  for (uint8_t col = 0; col < LCD1602_COLS; col++)
+  for (uint8_t col = 0; col < LCD2004_COLS; col++)
   {
     char ch = (*text != '\0') ? *text++ : ' ';
     if (lcd_send_byte((uint8_t)ch, LCD_RS) != 0)

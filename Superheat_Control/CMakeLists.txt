@@ -49,7 +49,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     Core/Src/plant.c
     Core/Src/bme280.c
     Core/Src/i2c1_bus.c
-    Core/Src/lcd1602.c
+    Core/Src/lcd2004.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_i2c.c
     Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_i2c_ex.c
 )
