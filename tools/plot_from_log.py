@@ -17,15 +17,16 @@ def main():
     parser.add_argument("--out", help="Save the figure to this path instead of just showing it")
     args = parser.parse_args()
 
-    ticks, plant_temp, valve, setpoint = [], [], [], []
+    ticks, plant_temp, valve, setpoint, ambient = [], [], [], [], []
     with open(args.log_path, newline="") as f:
         for row in csv.DictReader(f):
             ticks.append(int(row["tick"]))
             plant_temp.append(float(row["plant_degC"]))
             valve.append(float(row["valve"]) * 100.0)
             setpoint.append(float(row["setpoint_degC"]))
+            ambient.append(float(row["bme280_degC"]))
 
-    fig, (ax_temp, ax_valve) = plt.subplots(2, 1, sharex=True, figsize=(9, 6))
+    fig, (ax_temp, ax_valve, ax_amb) = plt.subplots(3, 1, sharex=True, figsize=(9, 8))
 
     ax_temp.plot(ticks, plant_temp, label="Superheat (simulated plant), °C")
     ax_temp.plot(ticks, setpoint, "--", label="Superheat setpoint, °C")
@@ -36,9 +37,14 @@ def main():
 
     ax_valve.plot(ticks, valve, color="tab:orange", label="Valve opening, %")
     ax_valve.set_ylabel("Valve opening (%)")
-    ax_valve.set_xlabel("Tick")
     ax_valve.legend(loc="upper right")
     ax_valve.grid(True)
+
+    ax_amb.plot(ticks, ambient, color="tab:red", label="Ambient (BME280, load disturbance), °C")
+    ax_amb.set_ylabel("Ambient (°C)")
+    ax_amb.set_xlabel("Tick")
+    ax_amb.legend(loc="upper right")
+    ax_amb.grid(True)
 
     plt.tight_layout()
 

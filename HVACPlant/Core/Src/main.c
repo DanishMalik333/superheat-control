@@ -113,8 +113,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 }
 
 /* Waits (with a timeout) for HAL_UART_RxCpltCallback to assemble one
- * "<tick>,<value>\r\n" line from USART1. Returns 1 on success. */
-static int Link_ReceiveLine(unsigned long *tick, double *value)
+ * "<tick>,<value>[,<ambient>]\r\n" line from USART1. Returns 1 on success.
+ * The ambient field is optional: Board 1 omits it when it has no valid
+ * BME280 reading, and *has_ambient tells the caller which case it was. */
+static int Link_ReceiveLine(unsigned long *tick, double *value, double *ambient, int *has_ambient)
 {
   uint32_t start = HAL_GetTick();
 
@@ -126,7 +128,9 @@ static int Link_ReceiveLine(unsigned long *tick, double *value)
     }
   }
 
-  int ok = (link_rx_len > 0) && (sscanf(link_rx_line, "%lu,%lf", tick, value) == 2);
+  int fields = (link_rx_len > 0) ? sscanf(link_rx_line, "%lu,%lf,%lf", tick, value, ambient) : 0;
+  int ok = (fields >= 2);
+  *has_ambient = (fields == 3);
 
   link_rx_len = 0;
   link_rx_line_ready = 0;
@@ -177,10 +181,15 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
 
-  Plant_Init(&plant, PLANT_NUM, PLANT_DEN, LINK_INITIAL_Y);
+  Plant_Init(&plant, PLANT_NUM, PLANT_DEN, PLANT_NUM_AMBIENT, LINK_INITIAL_Y);
 
-  printf("HVACPlant: plant simulator ready (num=%.6f, den=%.6f, Ts=%.2fs)\r\n",
-         PLANT_NUM, PLANT_DEN, PLANT_TS);
+  printf("HVACPlant: plant simulator ready (num=%.6f, den=%.6f, num_d=%.6f, Ts=%.2fs, ambient ref=%.1fC)\r\n",
+         PLANT_NUM, PLANT_DEN, PLANT_NUM_AMBIENT, PLANT_TS, PLANT_AMBIENT_REF_DEGC);
+
+  /* Ambient deviation fed to the plant. Held at its last value when a frame
+   * arrives without an ambient field, so a brief sensor dropout on Board 1
+   * doesn't show up as a step disturbance. */
+  double ambient_dev = 0.0;
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -189,12 +198,20 @@ int main(void)
   {
     unsigned long tick = 0;
     double valve_output = 0.0;
+    double ambient_degC = 0.0;
+    int has_ambient = 0;
 
-    if (Link_ReceiveLine(&tick, &valve_output))
+    if (Link_ReceiveLine(&tick, &valve_output, &ambient_degC, &has_ambient))
     {
-      double simulated_temp = Plant_Update(&plant, valve_output);
+      if (has_ambient)
+      {
+        ambient_dev = ambient_degC - PLANT_AMBIENT_REF_DEGC;
+      }
+
+      double simulated_temp = Plant_Update(&plant, valve_output, ambient_dev);
       Link_SendLine(tick, simulated_temp);
-      printf("tick=%lu valve=%.4f -> y=%.4f\r\n", tick, valve_output, simulated_temp);
+      printf("tick=%lu valve=%.4f ambient_dev=%+.2f -> y=%.4f\r\n",
+             tick, valve_output, ambient_dev, simulated_temp);
     }
     else
     {

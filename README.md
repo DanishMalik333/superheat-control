@@ -17,31 +17,35 @@ steady state. Captured live from Board 1's UART debug stream — see
 | | Board 1 — Controller | Board 2 — Plant Simulator |
 |---|---|---|
 | Folder | `Superheat_Control/` | `HVACPlant/` |
-| Role | Reads a real BME280 temperature sensor over SPI, runs the discrete PID loop | Runs a discretized transfer-function model of the refrigeration plant |
-| Sensor | BME280 (SPI1, logged only — not yet part of the control loop) | None |
+| Role | Runs the discrete PID loop, measures real ambient temperature, drives the LCD | Runs a discretized transfer-function model of the refrigeration plant |
+| Sensor | BME280 over SPI1 *or* I2C1 (build option) — ambient temperature, fed to the plant as a load disturbance | None |
+| Display | 16x2 HD44780 LCD with PCF8574 I2C backpack (I2C1) | None |
 | Debug output | USART2 → ST-LINK VCP (CSV telemetry) | USART2 → ST-LINK VCP (per-tick log) |
 | Inter-board link | USART1 (PA9/PA10), master side | USART1 (PA9/PA10), replies to each frame |
 
-Board 1 sends `valve_output` to Board 2 every control cycle; Board 2 runs it
-through the plant model and replies with the resulting simulated temperature,
-which becomes the PID's measurement input. This makes the HIL loop a genuine
-closed loop — the controller board never sees the "real" plant, only what the
-second board computes and sends back over the wire.
+Board 1 sends `valve_output` and the measured ambient temperature to Board 2
+every control cycle; Board 2 runs them through the plant model and replies
+with the resulting simulated superheat, which becomes the PID's measurement
+input. This makes the HIL loop a genuine closed loop — the controller board
+never sees the "real" plant, only what the second board computes and sends
+back over the wire.
 
 ```mermaid
 flowchart LR
     subgraph Board1["Board 1 — Controller"]
-        BME280["BME280\n(SPI1, logged only)"]
+        BME280["BME280\n(SPI1 or I2C1)"]
         PID["Discrete PID\npid.c"]
+        LCD["16x2 LCD\n(I2C1)"]
     end
 
     subgraph Board2["Board 2 — Plant Simulator"]
         Plant["Discrete plant model\nplant.c"]
     end
 
-    BME280 -.->|"logged, not yet\nin control loop"| PID
     PID -->|"valve_output\n(USART1, 115200)"| Plant
-    Plant -->|"simulated_temp\n(USART1, 115200)"| PID
+    BME280 -->|"ambient temp\n(USART1, 115200)"| Plant
+    Plant -->|"simulated superheat\n(USART1, 115200)"| PID
+    PID --> LCD
 
     Board1 -->|"CSV telemetry"| VCP1["ST-LINK VCP\n(USART2)"]
     Board2 -->|"per-tick log"| VCP2["ST-LINK VCP\n(USART2)"]
@@ -51,16 +55,78 @@ flowchart LR
 
 - Discrete PID: `pid.c` / `pid.h` — parallel P+I form with output clamping
   (anti-windup), `Kp=0.1`, `Ki=0.015`, `Kd=0`, sample time `Ts=1.0s`.
-- Discrete plant model: `plant.c` / `plant.h` — `y[n] = den*y[n-1] + num*u[n-1]`,
+- Discrete plant model: `plant.c` / `plant.h` — `y[n] = den*y[n-1] + num*u[n-1] + num_d*d[n-1]`,
   implementing `3.2739 / (z - 0.8363)` at `Ts=1.0s` (re-discretized from a
   continuous model with `tau≈5.594s`, `K=20.0`, originally tuned at `Ts=0.01s`
-  in Simulink).
+  in Simulink), plus the ambient disturbance below.
+
+### Ambient temperature as a load disturbance
+
+A warmer room raises the evaporator's heat load, which pushes superheat up.
+Board 1's BME280 measures the real room temperature and Board 2 feeds the
+deviation from a 22 °C reference into the plant through the same first-order
+lag as the valve: `Gd(s) = Kd/(tau*s + 1)` with `Kd = 0.5` °C superheat per
+°C ambient, discretized with the plant's pole so `num_d = Kd*(1 - den)`.
+
+The controller never sees the ambient reading — it has to reject the
+disturbance purely from its effect on superheat, as it would on a real plant.
+Warming the sensor with a hand (≈ +8 °C) lifts superheat by roughly 1 °C
+before the PI loop pulls it back to the setpoint in about 20 s, closing the
+valve from 50 % to 30 % to compensate; letting go produces the mirror image.
+`tools/plot_live.py` shows the ambient trace underneath the loop response.
+
+If the sensor is missing or a read fails, Board 1 sends no ambient field and
+Board 2 holds the last disturbance it received rather than stepping back to
+zero.
 
 ### Inter-board link protocol
 
-Plain ASCII CSV over USART1 at 115200 baud: `"<tick>,<value>\r\n"`. Deliberately
-kept separate from USART2, which is reserved on both boards for ST-LINK VCP
-debug logging.
+Plain ASCII CSV over USART1 at 115200 baud. Board 1 → Board 2:
+`"<tick>,<valve>,<ambient_degC>\r\n"` (the ambient field is omitted when there
+is no valid reading). Board 2 → Board 1: `"<tick>,<superheat>\r\n"`.
+Deliberately kept separate from USART2, which is reserved on both boards for
+ST-LINK VCP debug logging.
+
+## BME280 over SPI or I2C
+
+The sensor driver (`bme280.c`) only needs register-level read and write, so it
+talks to the chip through a small bus interface (`BME280_Bus_t` in
+`bme280.h`). `bme280_bus_spi.c` and `bme280_bus_i2c.c` each implement it; the
+chip-ID check, calibration read and temperature compensation above them are
+identical for both. The bus is chosen at build time:
+
+```
+cmake --preset Debug                  # SPI (default)
+cmake --preset Debug -DBME280_BUS=I2C # I2C, sharing I2C1 with the LCD
+```
+
+The startup log reports which bus is in use (`# BME280 over I2C, chip_id=0x60`).
+
+## LCD display
+
+A 16x2 HD44780 character LCD on a PCF8574 I2C backpack (`lcd1602.c`) shows
+the live loop state, refreshed every 500 ms:
+
+```
+SH:10.2 SP:10.0     superheat and setpoint, °C
+V: 50%  Amb:23.4    valve opening and ambient, °C
+```
+
+The HD44780 runs in 4-bit mode: the PCF8574's eight outputs carry one data
+nibble plus RS/RW/EN/backlight, and data is latched on EN's falling edge, so
+every LCD byte is sent as one four-byte I2C transaction (EN high/low for each
+nibble). It's driven from its own lowest-priority `DisplayTask`, so the
+operator display can never delay the control or link tasks. If nothing
+answers at the LCD's address at startup, the task logs it and exits.
+
+### Sharing I2C1 between tasks
+
+In the I2C build, `SensorTask` (BME280) and `DisplayTask` (LCD) both use
+I2C1, and the HAL's I2C handle isn't safe to use from two tasks at once.
+`i2c1_bus.c` owns the bus and wraps every transfer in a FreeRTOS mutex with
+priority inheritance, so a transaction is never interleaved with another and
+the low-priority display task can't hold up the sensor task through priority
+inversion.
 
 ## Interrupt-driven UART reception
 
@@ -93,16 +159,25 @@ message queues that always hold the latest value:
 
 - **`SensorTask`** — reads the BME280 once per second, independent of the
   control loop's timing.
-- **`LinkTask`** (`osPriorityAboveNormal`) — sends `valve_output` to Board 2,
-  waits for its reply, and pushes the result into `SimTempQueue`.
+- **`LinkTask`** (`osPriorityAboveNormal`) — sends `valve_output` and the
+  latest ambient reading to Board 2, waits for its reply, and pushes the
+  result into `SimTempQueue`.
 - **`ControlTask`** — reads `SimTempQueue`, runs `PID_Update`, pushes the new
   `valve_output` into `ValveOutputQueue`, and prints the CSV debug line.
+- **`DisplayTask`** (`osPriorityBelowNormal`) — refreshes the LCD every
+  500 ms. Created in user code rather than CubeMX.
+
+The latest ambient reading and the values shown on the LCD are shared as
+`volatile float`s rather than through queues: each has one writer, and an
+aligned 32-bit access is atomic on the Cortex-M4, so a reader can never see
+a half-written value. (A `double` would need two accesses and could tear.)
 
 ```mermaid
 flowchart TB
     Sensor["SensorTask\n(osPriorityNormal)\nBME280 read, 1s"]
     Link["LinkTask\n(osPriorityAboveNormal)\nUART exchange w/ Board 2"]
     Control["ControlTask\n(osPriorityNormal)\nPID_Update + CSV log"]
+    Display["DisplayTask\n(osPriorityBelowNormal)\nLCD refresh, 500ms"]
 
     ValveQ[["ValveOutputQueue\n(depth 1)"]]
     TempQ[["SimTempQueue\n(depth 1)"]]
@@ -112,7 +187,9 @@ flowchart TB
     Link -->|"simulated_temp"| TempQ
     TempQ -->|"simulated_temp"| Control
 
-    Sensor -.->|"latest_bme280_degC\n(logged only)"| Control
+    Sensor -.->|"latest_bme280_degC"| Link
+    Sensor -.->|"latest_bme280_degC"| Display
+    Control -.->|"superheat, valve"| Display
 ```
 
 Two issues surfaced while bringing this up, both worth knowing if you extend
@@ -127,8 +204,8 @@ this further:
   newlib-nano is stack-heavy, more than bare-metal's single large shared stack
   ever made obvious. `configCHECK_FOR_STACK_OVERFLOW` and a
   `vApplicationStackOverflowHook` were added to surface this instead of
-  silently corrupting memory; `LinkTask`/`ControlTask` are now sized to 512
-  words, `SensorTask` to 256.
+  silently corrupting memory; `LinkTask`/`ControlTask`/`DisplayTask` are now sized
+  to 512 words, `SensorTask` to 256.
 
 `Link_ReceiveLine`'s wait loop also switched from a bare spin to `osDelay(1)`
 per iteration — `LinkTask` runs at the highest priority, so a non-yielding
@@ -167,6 +244,28 @@ can start from different states.
 Board 2 is powered externally (E5V via CN7 pin 6, JP5 jumper moved to the E5V
 position, JP1 removed) since it has no USB connection of its own in the HIL
 setup.
+
+### Board 1 peripherals
+
+| Device | Board 1 pin | Device pin |
+|---|---|---|
+| BME280, SPI build | D13 (PA5, SPI1_SCK) | SCL/SCK |
+| | D12 (PA6, SPI1_MISO) | SDO |
+| | D11 (PA7, SPI1_MOSI) | SDA/SDI |
+| | D10 (PB6, GPIO) | CSB |
+| BME280, I2C build | D15 (PB8, I2C1_SCL) | SCL/SCK |
+| | D14 (PB9, I2C1_SDA) | SDA/SDI |
+| | 3V3 | CSB (must be high at power-up, or the chip latches into SPI mode) |
+| | GND | SDO (address 0x76; tie to 3V3 for 0x77) |
+| LCD backpack | D15 (PB8, I2C1_SCL) | SCL |
+| | D14 (PB9, I2C1_SDA) | SDA |
+| | 5V | VCC |
+
+All I2C devices share the same two wires, plus 3V3/5V and GND. The LCD's
+backpack pulls SDA/SCL up to 5V; PB8/PB9 are 5V-tolerant, but most BME280
+breakouts aren't unless they have an onboard level shifter. When both are on
+the bus, use a BME280 board with a level shifter, remove the backpack's
+pull-up resistors, or put a bidirectional level shifter between them.
 
 ## Plotting the control loop
 
