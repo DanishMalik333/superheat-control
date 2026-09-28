@@ -5,6 +5,13 @@ STM32 Nucleo-F401RE boards. In the absence of a physical expansion valve and
 evaporator, a second Nucleo runs a discretized transfer-function model of the
 plant, closing a real control loop over a live inter-board link.
 
+![LCD showing the live control loop](docs/images/lcd_demo.gif)
+
+*Board 1's 20x4 LCD running on the hardware rig: simulated superheat held at
+the 10 °C setpoint, the valve opening the PI controller is commanding, and
+the real ambient temperature from the BME280.
+[Full demo video](docs/videos/lcd_demo.mp4).*
+
 ![Step response](docs/images/step_response.png)
 
 *Simulated superheat converging to a 10°C setpoint under discrete PID control
@@ -119,9 +126,12 @@ as `--.-`. The 20x4 panel is addressed as two 40-character HD44780 lines
 split in half, so rows 0-3 start at DDRAM 0x00, 0x40, 0x14 and 0x54.
 
 The HD44780 runs in 4-bit mode: the PCF8574's eight outputs carry one data
-nibble plus RS/RW/EN/backlight, and data is latched on EN's falling edge, so
-every LCD byte is sent as one four-byte I2C transaction (EN high/low for each
-nibble). It's driven from its own lowest-priority `DisplayTask`, so the
+nibble plus RS/RW/EN/backlight. The controller samples RS on EN's rising edge
+and latches data on the falling edge, so each nibble is three PCF8574 writes:
+data and RS with EN low, then EN high, then EN low. Every LCD byte is one
+six-byte I2C transaction. An earlier version raised EN in the same write that
+changed RS, which occasionally latched the wrong RS: characters ran as
+commands (turning the display off and on) and commands printed as text. It's driven from its own lowest-priority `DisplayTask`, so the
 operator display can never delay the control or link tasks. If nothing
 answers at the LCD's address at startup, the task logs it and exits.
 
