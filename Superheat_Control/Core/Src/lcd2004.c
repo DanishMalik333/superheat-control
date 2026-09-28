@@ -20,16 +20,19 @@ static const uint8_t row_offsets[LCD2004_ROWS] = { 0x00, 0x40, 0x14, 0x54 };
 
 static void (*lcd_delay_ms)(uint32_t ms);
 
-/* The HD44780 latches data on EN's falling edge, so each nibble is sent as
- * two PCF8574 writes - EN high, then EN low. Sending both bytes (and both
- * nibbles of a full byte) in one I2C transaction keeps it to a single bus
- * access per LCD byte. At 100 kHz each PCF8574 byte takes ~90 us, which
- * already covers the EN pulse width and the 37 us command execution time. */
+/* The HD44780 samples RS on EN's rising edge and latches data on its falling
+ * edge. The PCF8574 updates all eight pins at once, so RS and data must be
+ * put on the pins with EN low first, and only then pulsed - raising EN in the
+ * same write as an RS change can latch the wrong RS, turning characters into
+ * commands (e.g. display off) and commands into characters. Each nibble is
+ * therefore three PCF8574 writes: set, EN high, EN low. All of them go in one
+ * I2C transaction; at 100 kHz each byte takes ~90 us, which covers the EN
+ * pulse width and the 37 us command execution time. */
 static int lcd_send_byte(uint8_t value, uint8_t mode)
 {
   uint8_t hi = (value & 0xF0) | mode | LCD_BACKLIGHT;
   uint8_t lo = (uint8_t)((value << 4) & 0xF0) | mode | LCD_BACKLIGHT;
-  uint8_t frame[4] = { hi | LCD_EN, hi, lo | LCD_EN, lo };
+  uint8_t frame[6] = { hi, hi | LCD_EN, hi, lo, lo | LCD_EN, lo };
 
   return I2C1_Transmit(LCD2004_I2C_ADDR, frame, sizeof(frame));
 }
@@ -39,7 +42,7 @@ static int lcd_send_byte(uint8_t value, uint8_t mode)
 static int lcd_send_nibble(uint8_t nibble)
 {
   uint8_t bits = (uint8_t)((nibble << 4) & 0xF0) | LCD_BACKLIGHT;
-  uint8_t frame[2] = { bits | LCD_EN, bits };
+  uint8_t frame[3] = { bits, bits | LCD_EN, bits };
 
   return I2C1_Transmit(LCD2004_I2C_ADDR, frame, sizeof(frame));
 }
