@@ -26,6 +26,8 @@
 #include "bme280.h"
 #include "i2c1_bus.h"
 #include "lcd2004.h"
+#include "FreeRTOS.h"
+#include "task.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -96,7 +98,9 @@ static PID_t pid;
 /* Interrupt-driven USART1 line reception. HAL_UART_Receive_IT is re-armed for
  * one byte at a time from the RxCpltCallback, so incoming bytes are captured
  * by the peripheral/ISR regardless of what the main loop is doing, avoiding
- * the overrun that polling HAL_UART_Receive suffered from. */
+ * the overrun that polling HAL_UART_Receive suffered from. When a full line is
+ * assembled the ISR sends LinkTask a task notification, so LinkTask blocks
+ * until the line is ready instead of polling link_rx_line_ready. */
 static uint8_t link_rx_byte;
 static char link_rx_line[LINK_RX_BUF_LEN];
 static volatile uint16_t link_rx_len = 0;
@@ -174,6 +178,7 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   }
 
   uint8_t ch = link_rx_byte;
+  BaseType_t higher_priority_woken = pdFALSE;
 
   if (!link_rx_line_ready)
   {
@@ -181,6 +186,15 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     {
       link_rx_line[link_rx_len] = '\0';
       link_rx_line_ready = 1;
+
+      /* Wake LinkTask. USART1 runs at NVIC priority 5, which is allowed to
+       * call FromISR APIs (configMAX_SYSCALL_INTERRUPT_PRIORITY). The guard
+       * covers bytes arriving before the scheduler has started. */
+      if ((LinkTaskHandle != NULL) &&
+          (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED))
+      {
+        vTaskNotifyGiveFromISR((TaskHandle_t)LinkTaskHandle, &higher_priority_woken);
+      }
     }
     else if (ch != '\r')
     {
@@ -197,22 +211,29 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   }
 
   HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
+
+  /* If LinkTask outranks the interrupted task, switch to it on exit. */
+  portYIELD_FROM_ISR(higher_priority_woken);
 }
 
-/* Waits (with a timeout) for HAL_UART_RxCpltCallback to assemble one
- * "<tick>,<value>\r\n" line from USART1. Returns 1 on success. */
+/* Blocks (with a 500 ms timeout) until HAL_UART_RxCpltCallback has assembled
+ * one "<tick>,<value>\r\n" line from USART1 and notified this task. Returns 1
+ * on success. The flag is re-checked after each wake-up, so a stale
+ * notification left over from an earlier late reply can't end the wait early. */
 static int Link_ReceiveLine(unsigned long *tick, double *value)
 {
   uint32_t start = HAL_GetTick();
 
   while (!link_rx_line_ready)
   {
-    if ((HAL_GetTick() - start) > 500)
+    uint32_t elapsed = HAL_GetTick() - start;
+
+    if (elapsed >= 500)
     {
       return 0;
     }
 
-    osDelay(1);
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500 - elapsed));
   }
 
   int ok = (link_rx_len > 0) && (sscanf(link_rx_line, "%lu,%lf", tick, value) == 2);
