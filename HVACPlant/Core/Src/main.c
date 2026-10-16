@@ -112,6 +112,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
   HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
 }
 
+/* A receive overrun makes HAL_UART_IRQHandler abort the interrupt-driven
+ * receive and report it here. Without re-arming, Board 2 would never hear
+ * Board 1 again and the rig would look like a permanent link fault. */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1 && huart->RxState == HAL_UART_STATE_READY)
+  {
+    HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
+  }
+}
+
 /* Waits (with a timeout) for HAL_UART_RxCpltCallback to assemble one
  * "<tick>,<value>[,<ambient>]\r\n" line from USART1. Returns 1 on success.
  * The ambient field is optional: Board 1 omits it when it has no valid
@@ -209,9 +220,18 @@ int main(void)
       }
 
       double simulated_temp = Plant_Update(&plant, valve_output, ambient_dev);
-      Link_SendLine(tick, simulated_temp);
-      printf("tick=%lu valve=%.4f ambient_dev=%+.2f -> y=%.4f\r\n",
-             tick, valve_output, ambient_dev, simulated_temp);
+
+      /* The plant keeps evolving while muted - only the reply is lost. LD2
+       * shows when the link is being held down. */
+      int muted = (HAL_GPIO_ReadPin(LINK_MUTE_GPIO_Port, LINK_MUTE_Pin) == GPIO_PIN_SET);
+      HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, muted ? GPIO_PIN_SET : GPIO_PIN_RESET);
+
+      if (!muted)
+      {
+        Link_SendLine(tick, simulated_temp);
+      }
+      printf("tick=%lu valve=%.4f ambient_dev=%+.2f -> y=%.4f%s\r\n",
+             tick, valve_output, ambient_dev, simulated_temp, muted ? " (muted)" : "");
     }
     else
     {
@@ -370,6 +390,12 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* Configured here rather than in the .ioc so the generated code stays as
+   * CubeMX produced it. GPIOB's clock is already enabled above. */
+  GPIO_InitStruct.Pin = LINK_MUTE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  HAL_GPIO_Init(LINK_MUTE_GPIO_Port, &GPIO_InitStruct);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 

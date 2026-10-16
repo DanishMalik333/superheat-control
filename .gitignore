@@ -20,3 +20,5 @@ Thumbs.db
 
 # Live-plot run logs
 tools/logs/
+tests/hil/out/
+__pycache__/

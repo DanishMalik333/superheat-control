@@ -1,0 +1,56 @@
+name: HIL
+
+# Runs on the Raspberry Pi next to the rig. Push and manual runs only: a
+# pull_request trigger would let other people's code run on the Pi.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# There is one rig, so one run at a time; a newer push waits its turn.
+concurrency:
+  group: hil-rig
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  closed-loop:
+    runs-on: [self-hosted, hil]
+    timeout-minutes: 30
+    env:
+      BME280_BUS: SPI   # match how the sensor is wired on the rig
+      MUTE_GPIO: "17"   # Pi BCM pin wired to Board 2 D4
+      MPLBACKEND: Agg
+    steps:
+      - uses: actions/checkout@v4
+
+      # The venv from tools/hil/setup_pi.sh (~ isn't expanded inside env:)
+      - run: echo "PY=$HOME/hil-venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Build Board 1
+        working-directory: Superheat_Control
+        run: |
+          cmake --preset Debug -DBME280_BUS=$BME280_BUS
+          cmake --build --preset Debug
+
+      - name: Flash Board 1
+        run: bash tools/hil/flash.sh Superheat_Control/build/Debug/Superheat_Control.elf
+
+      - name: Closed-loop tests
+        run: $PY -m pytest tests/hil --mute-gpio "$MUTE_GPIO" --junitxml=tests/hil/out/junit.xml
+
+      - name: Plot each test's run
+        if: always()
+        run: |
+          for f in tests/hil/out/*.csv; do
+            [ -e "$f" ] || continue
+            $PY tools/plot_from_log.py "$f" --out "${f%.csv}.png"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hil-results
+          path: tests/hil/out/

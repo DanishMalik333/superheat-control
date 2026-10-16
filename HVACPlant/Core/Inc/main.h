@@ -73,6 +73,12 @@ void Error_Handler(void);
 #define SWO_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
+/* Fault injection for the HIL tests: while this pin is high, the plant keeps
+ * running but sends no replies, as if the Board 2 -> Board 1 wire were cut.
+ * D4 on the Nucleo headers, driven by a Raspberry Pi GPIO. Pulled down, so
+ * the board behaves normally with nothing connected. */
+#define LINK_MUTE_Pin GPIO_PIN_5
+#define LINK_MUTE_GPIO_Port GPIOB
 
 /* USER CODE END Private defines */
 

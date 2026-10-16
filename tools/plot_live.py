@@ -5,7 +5,8 @@ Usage:
     python plot_live.py COM4 [--baud 115200] [--window 120]
 
 Board 1 prints one CSV header line, then one data row per tick:
-    tick,bme280_degC,plant_degC,valve,setpoint_degC
+    tick,bme280_degC,plant_degC,valve,setpoint_degC,link_ok
+(firmware before the HIL test bench has no link_ok column; it's logged as 1).
 Lines starting with '#' are comments (e.g. dropped-frame notices) and are skipped.
 
 Every row read is appended to a timestamped CSV file in ./logs/ regardless of
@@ -24,7 +25,7 @@ import serial
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-FIELDS = ["tick", "bme280_degC", "plant_degC", "valve", "setpoint_degC"]
+FIELDS = ["tick", "bme280_degC", "plant_degC", "valve", "setpoint_degC", "link_ok"]
 
 
 def main():
@@ -82,15 +83,18 @@ def main():
             if not line or line.startswith("#") or line.startswith("tick,"):
                 continue
             parts = line.split(",")
+            if len(parts) == len(FIELDS) - 1:
+                parts.append("1")
             if len(parts) != len(FIELDS):
                 continue
             try:
                 tick = int(parts[0])
-                bme, plant, val, sp = (float(x) for x in parts[1:])
+                bme, plant, val, sp = (float(x) for x in parts[1:5])
+                link_ok = int(parts[5])
             except ValueError:
                 continue
 
-            writer.writerow([tick, bme, plant, val, sp])
+            writer.writerow([tick, bme, plant, val, sp, link_ok])
             log_file.flush()
 
             ticks.append(tick)

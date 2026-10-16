@@ -203,6 +203,12 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
     /* USER CODE BEGIN USART2_MspInit 1 */
+    /* VCP command reception (CommandTask). Enabled here rather than in the
+     * .ioc; if the USART2 global interrupt is ever ticked in CubeMX, delete
+     * this and USART2_IRQHandler in stm32f4xx_it.c's USER CODE 1 section.
+     * Priority 5 so the ISR may call FromISR APIs, same as USART1. */
+    HAL_NVIC_SetPriority(USART2_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
 
     /* USER CODE END USART2_MspInit 1 */
   }

@@ -30,6 +30,8 @@
 #include "task.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 /* USER CODE END Includes */
 
@@ -47,7 +49,19 @@
 #define PID_OUT_MAX   0.9
 
 #define LINK_RX_BUF_LEN   32
-#define SETPOINT_DEGC     10.0 /* superheat setpoint, degC */
+#define SETPOINT_DEGC     10.0 /* default superheat setpoint, degC */
+#define SETPOINT_MIN_DEGC 0.0  /* range accepted from the "sp" command */
+#define SETPOINT_MAX_DEGC 40.0
+
+/* Link fault handling. After LINK_FAULT_MISSES exchanges in a row without a
+ * valid reply, ControlTask stops running the PID and holds the valve at
+ * VALVE_SAFE until Board 2 answers again. On a real plant the fallback
+ * opening comes from commissioning data; here it is just a fixed value the
+ * HIL tests can check for. */
+#define LINK_FAULT_MISSES 2
+#define VALVE_SAFE        0.3
+
+#define CMD_RX_BUF_LEN    32
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -120,6 +134,36 @@ static int bme280_ok = 0;
 static volatile float display_superheat_degC = NAN;
 static volatile float display_valve = NAN;
 
+/* Superheat setpoint, written by CommandTask ("sp" command on the VCP) and
+ * read by ControlTask and DisplayTask. Float for the same reason as above. */
+static volatile float setpoint_degC = (float)SETPOINT_DEGC;
+
+/* 1 while Board 2 is answering, 0 after LINK_FAULT_MISSES missed exchanges.
+ * Written by LinkTask, read by ControlTask. Starts at 1 so boot behaviour is
+ * unchanged when Board 2 is present. */
+static volatile uint8_t link_ok = 1;
+
+/* Interrupt-driven USART2 (ST-LINK VCP) command reception, the same scheme as
+ * USART1: the ISR assembles one line and notifies CommandTask. Lets a host
+ * test script change the setpoint or reset the board without a debugger. */
+static uint8_t cmd_rx_byte;
+static char cmd_rx_line[CMD_RX_BUF_LEN];
+static volatile uint16_t cmd_rx_len = 0;
+static volatile uint8_t cmd_rx_line_ready = 0;
+static volatile uint8_t cmd_rx_discarding = 0;
+
+/* newlib-nano's float formatting and parsing (printf/snprintf %f, sscanf %lf,
+ * strtod) share global state - one stdout buffer and one Bigint freelist -
+ * with no locking of their own. LinkTask, ControlTask, CommandTask and
+ * DisplayTask all use them, so every such call from a task holds this
+ * mutex. Priority inheritance keeps the low-priority DisplayTask from
+ * delaying LinkTask. */
+static osMutexId_t stdio_mutex;
+static const osMutexAttr_t stdio_mutex_attr = {
+  .name = "stdio",
+  .attr_bits = osMutexPrioInherit,
+};
+
 /* DisplayTask is created in the RTOS_THREADS user section rather than through
  * CubeMX, so its definition lives here instead of in the generated block. */
 osThreadId_t DisplayTaskHandle;
@@ -127,6 +171,13 @@ const osThreadAttr_t DisplayTask_attributes = {
   .name = "DisplayTask",
   .stack_size = 512 * 4, /* snprintf float formatting is stack-heavy */
   .priority = (osPriority_t) osPriorityBelowNormal,
+};
+
+osThreadId_t CommandTaskHandle;
+const osThreadAttr_t CommandTask_attributes = {
+  .name = "CommandTask",
+  .stack_size = 512 * 4, /* strtod is stack-heavy, like sscanf */
+  .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE END PV */
 
@@ -142,6 +193,7 @@ void StartControlTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 static void StartDisplayTask(void *argument);
+static void StartCommandTask(void *argument);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -167,11 +219,121 @@ int __io_putchar(int ch)
   return ch;
 }
 
+static void stdio_lock(void)
+{
+  osMutexAcquire(stdio_mutex, osWaitForever);
+}
+
+static void stdio_unlock(void)
+{
+  osMutexRelease(stdio_mutex);
+}
+
+/* printf for tasks: formats into a local buffer and sends the whole line
+ * with one HAL_UART_Transmit, all under stdio_mutex, so lines from different
+ * tasks never interleave. Code that runs before the scheduler starts keeps
+ * using plain printf. */
+static void log_printf(const char *fmt, ...)
+{
+  char buf[96];
+  va_list ap;
+
+  stdio_lock();
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+
+  if (n > 0)
+  {
+    if (n >= (int)sizeof(buf))
+    {
+      n = sizeof(buf) - 1; /* truncated, but still one line */
+    }
+    HAL_UART_Transmit(&huart2, (uint8_t *)buf, (uint16_t)n, HAL_MAX_DELAY);
+  }
+  stdio_unlock();
+}
+
+/* USART2 half of HAL_UART_RxCpltCallback: assembles one command line from the
+ * VCP, notifies CommandTask and re-arms the next single-byte receive. Bytes
+ * arriving while CommandTask still holds the previous line are dropped. */
+static void Cmd_RxByte(void)
+{
+  uint8_t ch = cmd_rx_byte;
+  BaseType_t higher_priority_woken = pdFALSE;
+
+  if (!cmd_rx_line_ready)
+  {
+    if (cmd_rx_discarding)
+    {
+      /* Rest of an overlong line: never run its tail as a command. */
+      if (ch == '\n' || ch == '\r')
+      {
+        cmd_rx_discarding = 0;
+      }
+    }
+    else if (ch == '\n' || ch == '\r')
+    {
+      if (cmd_rx_len > 0)
+      {
+        cmd_rx_line[cmd_rx_len] = '\0';
+        cmd_rx_line_ready = 1;
+
+        if ((CommandTaskHandle != NULL) &&
+            (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED))
+        {
+          vTaskNotifyGiveFromISR((TaskHandle_t)CommandTaskHandle, &higher_priority_woken);
+        }
+      }
+    }
+    else if (cmd_rx_len < CMD_RX_BUF_LEN - 1)
+    {
+      cmd_rx_line[cmd_rx_len++] = (char)ch;
+    }
+    else
+    {
+      /* Line too long: drop it and resync on the next line end. */
+      cmd_rx_len = 0;
+      cmd_rx_discarding = 1;
+    }
+  }
+
+  HAL_UART_Receive_IT(&huart2, &cmd_rx_byte, 1);
+  portYIELD_FROM_ISR(higher_priority_woken);
+}
+
+/* A receive overrun makes HAL_UART_IRQHandler abort the interrupt-driven
+ * receive and report it here. Without re-arming, that UART would never
+ * receive again. */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->RxState != HAL_UART_STATE_READY)
+  {
+    return; /* non-blocking error (noise, framing): reception continues */
+  }
+
+  if (huart->Instance == USART1)
+  {
+    HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
+  }
+  else if (huart->Instance == USART2)
+  {
+    HAL_UART_Receive_IT(&huart2, &cmd_rx_byte, 1);
+  }
+}
+
 /* Called from USART1_IRQHandler via HAL_UART_IRQHandler whenever one byte has
  * been received. Assembles line_rx_line and re-arms the next single-byte
- * receive so bytes are never missed while the main loop is busy elsewhere. */
+ * receive so bytes are never missed while the main loop is busy elsewhere.
+ * USART2 bytes (VCP commands) are handed to Cmd_RxByte. */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
+  if (huart->Instance == USART2)
+  {
+    Cmd_RxByte();
+    return;
+  }
+
   if (huart->Instance != USART1)
   {
     return;
@@ -236,7 +398,9 @@ static int Link_ReceiveLine(unsigned long *tick, double *value)
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500 - elapsed));
   }
 
+  stdio_lock();
   int ok = (link_rx_len > 0) && (sscanf(link_rx_line, "%lu,%lf", tick, value) == 2);
+  stdio_unlock();
 
   link_rx_len = 0;
   link_rx_line_ready = 0;
@@ -252,6 +416,7 @@ static void Link_SendLine(unsigned long tick, double value, float ambient_degC)
   char out[LINK_RX_BUF_LEN];
   int n;
 
+  stdio_lock();
   if (isnan(ambient_degC))
   {
     n = snprintf(out, sizeof(out), "%lu,%.4f\r\n", tick, value);
@@ -260,6 +425,7 @@ static void Link_SendLine(unsigned long tick, double value, float ambient_degC)
   {
     n = snprintf(out, sizeof(out), "%lu,%.4f,%.2f\r\n", tick, value, (double)ambient_degC);
   }
+  stdio_unlock();
 
   if (n < 0 || n >= (int)sizeof(out))
   {
@@ -304,6 +470,7 @@ int main(void)
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
   HAL_UART_Receive_IT(&huart1, &link_rx_byte, 1);
+  HAL_UART_Receive_IT(&huart2, &cmd_rx_byte, 1);
 
   uint8_t chip_id = 0;
   bme280_ok = (BME280_Init(&bme280_bus, &chip_id) == 0);
@@ -319,7 +486,7 @@ int main(void)
 
   PID_Init(&pid, PID_KP, PID_KI, PID_TS, PID_OUT_MIN, PID_OUT_MAX);
 
-  printf("tick,bme280_degC,plant_degC,valve,setpoint_degC\r\n");
+  printf("tick,bme280_degC,plant_degC,valve,setpoint_degC,link_ok\r\n");
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -328,6 +495,7 @@ int main(void)
   /* USER CODE BEGIN RTOS_MUTEX */
   /* SensorTask (I2C build) and DisplayTask share I2C1 */
   I2C1_CreateMutex();
+  stdio_mutex = osMutexNew(&stdio_mutex_attr);
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -361,6 +529,7 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   DisplayTaskHandle = osThreadNew(StartDisplayTask, NULL, &DisplayTask_attributes);
+  CommandTaskHandle = osThreadNew(StartCommandTask, NULL, &CommandTask_attributes);
   /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
@@ -584,6 +753,7 @@ static void DisplayRow(uint8_t row, const char *label, float value, const char *
 {
   char line[LCD2004_COLS + 1];
 
+  stdio_lock();
   if (isnan(value))
   {
     snprintf(line, sizeof(line), "%-10s  --.- %s", label, unit);
@@ -592,6 +762,7 @@ static void DisplayRow(uint8_t row, const char *label, float value, const char *
   {
     snprintf(line, sizeof(line), "%-10s%6.1f %s", label, (double)value, unit);
   }
+  stdio_unlock();
   LCD2004_WriteLine(row, line);
 }
 
@@ -611,7 +782,7 @@ static void StartDisplayTask(void *argument)
 
   if (LCD2004_Init(rtos_delay_ms) != 0)
   {
-    printf("# LCD not found at I2C address 0x%02X - display disabled\r\n", LCD2004_I2C_ADDR);
+    log_printf("# LCD not found at I2C address 0x%02X - display disabled\r\n", LCD2004_I2C_ADDR);
     osThreadExit();
   }
 
@@ -620,11 +791,77 @@ static void StartDisplayTask(void *argument)
     float valve = display_valve;
 
     DisplayRow(0, "Superheat", display_superheat_degC, deg_c);
-    DisplayRow(1, "Setpoint", (float)SETPOINT_DEGC, deg_c);
+    DisplayRow(1, "Setpoint", setpoint_degC, deg_c);
     DisplayRow(2, "Valve", isnan(valve) ? valve : valve * 100.0f, "%");
     DisplayRow(3, "Ambient", latest_bme280_degC, deg_c);
 
     osDelay(500);
+  }
+}
+
+/* Handles one line from the VCP:
+ *   sp <degC>   set the superheat setpoint   -> "# ok sp 13.00"
+ *   ping                                     -> "# pong"
+ *   reset       software reset of Board 1
+ * Anything else gets "# err ...". The HIL test bench drives the loop through
+ * these and reads the effect back from the CSV stream. */
+static void StartCommandTask(void *argument)
+{
+  (void)argument;
+
+  for (;;)
+  {
+    /* Check the flag before blocking: a line completed before the scheduler
+     * started set it without a notification. */
+    while (!cmd_rx_line_ready)
+    {
+      ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    }
+
+    char line[CMD_RX_BUF_LEN];
+    memcpy(line, cmd_rx_line, sizeof(line));
+    line[CMD_RX_BUF_LEN - 1] = '\0';
+    __DMB(); /* copy done before the ISR may reuse the buffer */
+    cmd_rx_len = 0;
+    cmd_rx_line_ready = 0;
+
+    if (strncmp(line, "sp ", 3) == 0)
+    {
+      char *end;
+      stdio_lock();
+      double sp = strtod(line + 3, &end);
+      stdio_unlock();
+
+      int parsed = (end != line + 3);
+      while (*end == ' ')
+      {
+        end++;
+      }
+
+      if (parsed && *end == '\0' && sp >= SETPOINT_MIN_DEGC && sp <= SETPOINT_MAX_DEGC)
+      {
+        setpoint_degC = (float)sp;
+        log_printf("# ok sp %.2f\r\n", sp);
+      }
+      else
+      {
+        log_printf("# err sp must be %.1f..%.1f\r\n", SETPOINT_MIN_DEGC, SETPOINT_MAX_DEGC);
+      }
+    }
+    else if (strcmp(line, "ping") == 0)
+    {
+      log_printf("# pong\r\n");
+    }
+    else if (strcmp(line, "reset") == 0)
+    {
+      log_printf("# resetting\r\n");
+      osDelay(10); /* let the line leave the UART */
+      NVIC_SystemReset();
+    }
+    else
+    {
+      log_printf("# err unknown command\r\n");
+    }
   }
 }
 /* USER CODE END 4 */
@@ -641,6 +878,7 @@ void StartLinkTask(void *argument)
   /* USER CODE BEGIN 5 */
   unsigned long tick = 0;
   double valve_output = PID_OUT_MIN;
+  unsigned misses = 0;
 
   for(;;)
   {
@@ -657,10 +895,18 @@ void StartLinkTask(void *argument)
     {
       osMessageQueueReset(SimTempQueueHandle);
       osMessageQueuePut(SimTempQueueHandle, &received_temp, 0, 0);
+      misses = 0;
+      link_ok = 1;
     }
     else
     {
-      printf("# HIL link: malformed/missing frame, holding last simulated_temp\r\n");
+      log_printf("# HIL link: malformed/missing frame, holding last simulated_temp\r\n");
+
+      if (++misses >= LINK_FAULT_MISSES && link_ok)
+      {
+        link_ok = 0;
+        log_printf("# FAULT link lost, valve held at %.2f\r\n", VALVE_SAFE);
+      }
     }
 
     tick++;
@@ -720,23 +966,47 @@ void StartControlTask(void *argument)
   /* USER CODE BEGIN StartControlTask */
   unsigned long tick = 0;
   double simulated_temp = 0.0;
+  uint8_t was_ok = 1;
 
   for(;;)
   {
+    /* link_ok is read before the queue: if LinkTask recovers in between, this
+     * cycle still holds the safe valve and the next one uses the fresh value,
+     * rather than restarting the PID on the pre-fault measurement. */
+    uint8_t ok = link_ok;
+
     /* Use the latest simulated temp from LinkTask if a new one arrived
      * since last cycle; otherwise hold the previous value. */
     osMessageQueueGet(SimTempQueueHandle, &simulated_temp, NULL, 0);
 
-    double valve_output = PID_Update(&pid, SETPOINT_DEGC, simulated_temp);
+    double setpoint = setpoint_degC;
+    double valve_output;
+
+    if (ok)
+    {
+      if (!was_ok)
+      {
+        /* Bumpless restart: the integrator picks up from the position the
+         * valve was held at during the fault. */
+        pid.integrator = VALVE_SAFE;
+      }
+      valve_output = PID_Update(&pid, setpoint, simulated_temp);
+    }
+    else
+    {
+      /* No feedback: the measurement is stale, so don't integrate on it. */
+      valve_output = VALVE_SAFE;
+    }
+    was_ok = ok;
 
     osMessageQueueReset(ValveOutputQueueHandle);
     osMessageQueuePut(ValveOutputQueueHandle, &valve_output, 0, 0);
 
-    display_superheat_degC = (float)simulated_temp;
+    display_superheat_degC = ok ? (float)simulated_temp : NAN;
     display_valve = (float)valve_output;
 
-    printf("%lu,%.2f,%.4f,%.3f,%.2f\r\n",
-           tick, (double)latest_bme280_degC, simulated_temp, valve_output, SETPOINT_DEGC);
+    log_printf("%lu,%.2f,%.4f,%.3f,%.2f,%u\r\n",
+           tick, (double)latest_bme280_degC, simulated_temp, valve_output, setpoint, ok);
 
     tick++;
     osDelay(1000);

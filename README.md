@@ -234,7 +234,10 @@ Superheat_Control_Project/
 ├── Superheat_Control/   Board 1 (Controller) — STM32CubeIDE/CMake project
 ├── HVACPlant/           Board 2 (Plant Simulator) — STM32CubeIDE/CMake project
 ├── tools/               Host-side Python scripts for live plotting & logging
+│   ├── hil/             Raspberry Pi bench setup and flashing scripts
 │   └── logs/            Timestamped CSV logs from tools/plot_live.py (gitignored)
+├── tests/hil/           Closed-loop pytest suite + software rig model
+├── .github/workflows/   HIL workflow for the self-hosted Pi runner
 └── docs/images/         Figures used in this README
 ```
 
@@ -299,3 +302,105 @@ To regenerate a static plot (e.g. for a report) from a saved log:
 ```
 python tools/plot_from_log.py tools/logs/run_20260926_151558.csv --out step_response.png
 ```
+
+## Automated HIL tests
+
+`tests/hil/` turns the rig into a regression test: pytest drives Board 1 over
+its VCP, steps the setpoint, cuts the link, and decides pass or fail from the
+CSV stream. A GitHub Actions runner on a Raspberry Pi 4 builds Board 1,
+flashes it and runs the tests on every push to `main`. For how it works and
+why it's built this way, see [docs/HIL_TEST_BENCH.md](docs/HIL_TEST_BENCH.md).
+
+```
+  GitHub push ──► Raspberry Pi 4 (self-hosted runner, label "hil")
+                    │ USB: ST-LINK flash + VCP          │ GPIO17 (+ GND)
+                    ▼                                   ▼
+                 Board 1 ◄──── USART1 link ────►     Board 2  (D4 = link mute)
+```
+
+Only Board 1 is on USB. Board 2's firmware changes rarely, so it is flashed
+by hand and left alone; the tests don't reflash it.
+
+| Test | Passes when |
+|---|---|
+| `test_boot` | After a `reset`, the CSV header arrives within 3 s, rows follow, and the link is up |
+| `test_step` | 10 → 13 °C step: overshoot < 10 % of the step, within ±0.3 °C after 30 ticks, valve inside its clamp |
+| `test_windup` | 40 ticks pinned at the 0.9 clamp (setpoint 30 °C), then back to 10 °C: undershoot < 10 %, within ±0.5 °C after 40 ticks |
+| `test_link_loss` | Board 2 muted: `link_ok` drops within 6 ticks, valve held at 0.3; unmuted: link back within 4 ticks, loop returns to 10 °C |
+
+Each test's rows are saved to `tests/hil/out/<test>.csv`; CI plots them with
+`tools/plot_from_log.py` and uploads the PNGs and a JUnit report as the
+`hil-results` artifact.
+
+### What the firmware adds for this
+
+- **Board 1 VCP commands** (USART2 RX, interrupt-driven like the link, handled
+  by a `CommandTask`): `sp <degC>` sets the setpoint, `ping` answers
+  `# pong`, `reset` does a software reset. Task output now goes through
+  `log_printf`, which holds a mutex for the whole line, so lines from different
+  tasks no longer interleave. newlib-nano's float formatting and parsing
+  aren't thread-safe, so every task-side `snprintf`/`sscanf`/`strtod` also
+  holds that mutex.
+- **Link fault handling on Board 1:** after 2 missed replies in a row,
+  `ControlTask` stops running the PID, holds the valve at `VALVE_SAFE` (0.3)
+  and prints `# FAULT link lost`. The LCD shows `--.-` for superheat. When
+  Board 2 answers again the integrator restarts from 0.3, so the valve
+  doesn't jump.
+- **`link_ok` column** at the end of each CSV row (1 = Board 2 answering).
+- **Board 2 link mute on D4 (PB5)**, pulled down. While it's high, Board 2
+  keeps updating the plant but sends no replies, as if the reply wire were
+  cut. LD2 lights while muted.
+
+### Wiring (in addition to the board-to-board link)
+
+| Raspberry Pi 4 | Board 2 (Plant Simulator) |
+|---|---|
+| GPIO17 (pin 11) | D4 (PB5) |
+| GND (pin 9) | GND |
+
+Both sides are 3.3 V logic, so no level shifting is needed. Board 1 plugs into
+any Pi USB port.
+
+### Running the tests
+
+Without hardware, against a software model of the rig (`tests/hil/sim.py`,
+which runs the same PI law, plant and fault logic as the firmware, about
+50× faster than real time):
+
+```
+pip install -r tests/hil/requirements.txt
+pytest tests/hil --sim
+pytest tests/hil --sim --sim-kp 0.3     # broken gains: the tests should fail
+```
+
+On the rig (from the Pi, or from a PC with Board 1 on USB; the VCP is found
+automatically, or pass `--port`):
+
+```
+pytest tests/hil --mute-gpio 17
+```
+
+Without `--mute-gpio`, `test_link_loss` is skipped. A full hardware run takes
+about 6 minutes.
+
+### Setting up the Pi runner
+
+1. On the Pi (Raspberry Pi OS Bookworm, 64-bit), clone the repo and run
+   `bash tools/hil/setup_pi.sh`. It installs `gcc-arm-none-eabi`, CMake, Ninja and
+   OpenOCD, and creates `~/hil-venv`. Log out and back in afterwards.
+2. Flash Board 2 once with the current `HVACPlant` firmware. Build it
+   (`cd HVACPlant && cmake --preset Debug && cmake --build --preset Debug`),
+   move the USB cable to Board 2, run
+   `bash tools/hil/flash.sh HVACPlant/build/Debug/HVACPlant.elf`, then move
+   the cable back to Board 1.
+3. Check the bench by hand: `~/hil-venv/bin/python -m pytest tests/hil --mute-gpio 17`.
+4. On GitHub: *Settings → Actions → Runners → New self-hosted runner →
+   Linux / ARM64*, run the commands it shows on the Pi, and add the label
+   `hil` when `config.sh` asks. Then install it as a service so it survives
+   reboots: `sudo ./svc.sh install $USER && sudo ./svc.sh start`.
+
+The workflow (`.github/workflows/hil.yml`) runs on push to `main` and from the
+Actions tab, never on pull requests. This repo is public, so also set
+*Settings → Actions → General → Fork pull request workflows* to require
+approval for all outside contributors. A fork's pull request could otherwise
+add its own workflow that targets the Pi.
