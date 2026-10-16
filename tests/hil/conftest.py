@@ -61,7 +61,11 @@ def rig(request):
 @pytest.fixture(scope="session")
 def board1(rig):
     b = Board1(rig, period=getattr(rig, "period", 1.0))
-    if not b.ping():
+    # Straight after flashing (as in CI), Board 1 may still be booting and a
+    # command sent then is lost. Wait for its first data row, then allow a
+    # few pings before deciding the firmware is wrong.
+    b.wait_for(lambda r: True, max_rows=5)
+    if not any(b.ping() for _ in range(3)):
         b.close()
         pytest.exit("Board 1 doesn't answer 'ping' - is the HIL firmware flashed?", returncode=3)
     yield b
