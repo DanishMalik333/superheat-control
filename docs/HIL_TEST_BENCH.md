@@ -326,8 +326,12 @@ on your Pi, inside your home network, as the runner's user. So:
 - In *Settings → Actions → General → Fork pull request workflows*, require
   approval for all outside contributors. The repo is public, and a fork's
   pull request could otherwise add its *own* workflow that targets the Pi.
-- Run the runner as an ordinary user without passwordless `sudo`, never as
-  root.
+- Run the runner as its own user with no `sudo` and no access to your home
+  folder, never as root or as your login user. On this rig it runs as
+  `hil-runner` (groups `dialout`, `plugdev`, `gpio` only) with its own
+  `~/hil-venv`. Raspberry Pi OS shares the sudo password cache across all of
+  a user's processes (`timestamp_type=global`), so a job running as your own
+  user minutes after you typed your sudo password could get root.
 
 ## 8. Setting up the Pi and running everything
 

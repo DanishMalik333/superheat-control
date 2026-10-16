@@ -25,6 +25,9 @@ jobs:
       MPLBACKEND: Agg
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Don't leave the job's token in .git/config on the Pi after the run.
+          persist-credentials: false
 
       # The venv from tools/hil/setup_pi.sh (~ isn't expanded inside env:)
       - run: echo "PY=$HOME/hil-venv/bin/python" >> "$GITHUB_ENV"
