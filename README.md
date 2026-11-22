@@ -235,6 +235,7 @@ Superheat_Control_Project/
 ├── HVACPlant/           Board 2 (Plant Simulator) — STM32CubeIDE/CMake project
 ├── tools/               Host-side Python scripts for live plotting & logging
 │   ├── hil/             Raspberry Pi bench setup and flashing scripts
+│   ├── mcp_hil/         MCP server that lets an AI assistant run and analyse the HIL tests
 │   └── logs/            Timestamped CSV logs from tools/plot_live.py (gitignored)
 ├── tests/hil/           Closed-loop pytest suite + software rig model
 ├── .github/workflows/   HIL workflow for the self-hosted Pi runner
@@ -404,3 +405,20 @@ Actions tab, never on pull requests. This repo is public, so also set
 *Settings → Actions → General → Fork pull request workflows* to require
 approval for all outside contributors. A fork's pull request could otherwise
 add its own workflow that targets the Pi.
+
+## MCP server for the HIL bench
+
+`tools/mcp_hil/` is an [MCP](https://modelcontextprotocol.io) server that lets an
+AI assistant (Claude Code or any MCP client) operate the HIL bench through a
+narrow, typed interface instead of a shell. It runs the same `tests/hil` pytest
+suite, reads the results, explains a failed run from the logged data, plots a
+run, changes the setpoint and reports CI status.
+
+- **Safe by default:** it uses the software rig model unless started with
+  `HIL_BACKEND=rig`. Flash, reset and link-fault injection are disabled unless
+  `HIL_ALLOW_DANGEROUS=1` is set and each call passes `confirm=true`.
+- **Quick start (simulator, no hardware):**
+  `python -m pytest tests/hil --sim`, or register the server with
+  `claude mcp add hil-bench -- <python> tools/mcp_hil/server.py`.
+- Full tool list, hardware (Raspberry Pi) usage and the safety model are in
+  [tools/mcp_hil/README.md](tools/mcp_hil/README.md).
