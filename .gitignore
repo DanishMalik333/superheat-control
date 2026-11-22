@@ -22,3 +22,6 @@ Thumbs.db
 tools/logs/
 tests/hil/out/
 __pycache__/
+
+# Local MATLAB/Simulink work (kept out of the public repo)
+Superheat_Control/MATLAB_simulation/
