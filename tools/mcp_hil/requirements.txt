@@ -1,0 +1,8 @@
+# MCP server for the HIL bench. Tested with Python 3.13 on Windows (sim backend).
+# mcp is pinned to the 1.x line on purpose: mcp 2.x renamed FastMCP to MCPServer.
+mcp==1.30.0
+# Same packages tests/hil needs (it only asks for minimum versions; pinned here).
+pytest==9.2.0
+pyserial==3.5
+matplotlib==3.11.2
+# Rig only (Raspberry Pi): gpiozero comes from apt (python3-gpiozero), see tools/hil/setup_pi.sh.
